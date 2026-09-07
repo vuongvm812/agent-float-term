@@ -1,0 +1,33 @@
+[package]
+name = "agent-float-term"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+description = "Harness Floating Terminal: a persistent F7 shell for unwrapped AI CLIs"
+license = "MIT"
+repository = "https://github.com/vuongvm812/agent-float-term"
+readme = "README.md"
+exclude = [".codegraph/", ".github/", "target/"]
+
+[dependencies]
+anyhow = "=1.0.95"
+clap = { version = "=4.5.23", features = ["derive"] }
+libc = "=0.2.169"
+serde = { version = "=1.0.217", features = ["derive"] }
+serde_json = "=1.0.135"
+sha2 = "=0.10.8"
+toml = "=0.8.19"
+
+[dev-dependencies]
+tempfile = "=3.15.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

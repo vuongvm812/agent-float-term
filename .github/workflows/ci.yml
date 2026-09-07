@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source commit to check
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.84.1
+
+jobs:
+  check:
+    name: Check (${{ matrix.target }}, tmux ${{ matrix.tmux }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            tmux: 3.3a
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            tmux: 3.7c
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            tmux: brew
+          - os: macos-14
+            target: aarch64-apple-darwin
+            tmux: brew
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Install Rust 1.84.1
+        run: rustup toolchain install 1.84.1 --profile minimal --component rustfmt --component clippy
+      - name: Install build and test dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential bison pkg-config libevent-dev libncurses-dev curl ca-certificates expect procps bash zsh
+      - name: Build checksum-pinned tmux (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TMUX_VERSION: ${{ matrix.tmux }}
+        run: bash scripts/install-ci-tmux.sh "$TMUX_VERSION"
+      - name: Install tmux and test shells (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux expect bash zsh
+      - name: Record tools and verify native target
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+          EXPECTED_TMUX: ${{ matrix.tmux }}
+        run: |
+          rustc -vV
+          cargo --version
+          tmux -V
+          expect -v
+          cc --version
+          bash --version
+          zsh --version
+          test -x /bin/kill
+          if [[ "$EXPECTED_TMUX" != brew ]]; then
+            test "$(tmux -V)" = "tmux $EXPECTED_TMUX"
+          fi
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          test "$host" = "$EXPECTED_TARGET"
+      - name: Formatting
+        run: cargo +1.84.1 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.84.1 clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +1.84.1 test --locked --all-targets
+      - name: Debug build
+        run: cargo +1.84.1 build --locked
+      - name: Isolated PTY smoke test
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+        run: expect tests/pty_smoke.exp target/debug/agent-float-term
+      - name: Isolated startup smoke test
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+        run: expect tests/startup_smoke.exp target/debug/agent-float-term
+      - name: Isolated autostart smoke test
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+        run: expect tests/autostart_smoke.exp target/debug/agent-float-term
+      - name: Isolated theme smoke test
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+        run: expect tests/theme_smoke.exp target/debug/agent-float-term
+      - name: Release build
+        run: cargo +1.84.1 build --locked --release

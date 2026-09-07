@@ -1,0 +1,486 @@
+#!/usr/bin/env expect
+# Optional, macOS-only, installed-binary smoke; deliberately not a CI dependency.
+# Usage: expect -N -n tests/actual_harness_smoke.exp BINARY [CLAUDE [OPENCODE [CODEX]]]
+# -N -n also suppress Expect's system/user startup files.
+# Omitted harnesses are discovered on the original PATH; '-' explicitly skips one.
+# Only reviewed versions are launched, with no arguments/prompts or trust approval.
+# Claude's SIMPLE mode skips OAuth/keychain and customization discovery; this
+# smoke does not cover authenticated/default-mode startup or model interaction.
+# References: https://code.claude.com/docs/en/env-vars
+#             https://opencode.ai/docs/cli/#environment-variables
+#             https://github.com/openai/codex/tree/rust-v0.153.4
+# Codex is tested at the sign-in chooser only, with an empty private CODEX_HOME.
+# OPENCODE_PURE is defense in depth; network/file isolation does not depend on it.
+set timeout 15
+log_user 0
+log_file
+exp_internal 0
+
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { return -code error -errorcode {AFT CHECK} $message }
+}
+proc absolute_executable {path} {
+    set path [file normalize $path]
+    for {set n 0} {$n < 32 && [file type $path] eq "link"} {incr n} {
+        set path [file normalize [file join [file dirname $path] [file readlink $path]]]
+    }
+    check {[file isfile $path] && [file executable $path]} "executable unavailable"
+    check {![regexp {[\x00-\x1f]} $path]} "control characters in executable path"
+    return $path
+}
+proc sbquote {value} {
+    return "\"[string map [list \\ \\\\ \" \\\"] $value]\""
+}
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket {*}$args]
+}
+proc processes {} {
+    set result [dict create]
+    # Metadata only: never read process arguments or environments.
+    foreach line [split [exec /bin/ps -axo pid=,ppid=,lstart=] \n] {
+        if {[regexp {^\s*(\d+)\s+(\d+)\s+(.+)$} $line ignored pid parent started]} {
+            dict set result $pid [list $parent $started]
+        }
+    }
+    return $result
+}
+proc remember_tree {} {
+    global owned leaders
+    set table [processes]
+    foreach pid $leaders {
+        if {[dict exists $table $pid] && ![dict exists $owned $pid]} {
+            dict set owned $pid [lindex [dict get $table $pid] 1]
+        }
+    }
+    set more 1
+    while {$more} {
+        set more 0
+        dict for {pid identity} $table {
+            lassign $identity parent started
+            if {![dict exists $owned $pid] && [dict exists $owned $parent] &&
+                [dict exists $table $parent] &&
+                [lindex [dict get $table $parent] 1] eq [dict get $owned $parent]} {
+                dict set owned $pid $started
+                set more 1
+            }
+        }
+    }
+}
+proc teardown {} {
+    global owned leaders handles root socket original_cwd startup_output
+    # Freeze the observed tree before parent exit can reparent a newly spawned
+    # helper. Rescan after stopping parents to include children born in that race.
+    for {set pass 0} {$pass < 2} {incr pass} {
+        remember_tree
+        set table [processes]
+        dict for {pid started} $owned {
+            if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} {
+                catch {exec /bin/kill -STOP $pid}
+            }
+        }
+    }
+    # Never signal by executable name, user ID, or an unverified process group.
+    # Retain identities observed before tmux exits, including reparented helpers.
+    foreach signal {TERM KILL} {
+        set table [processes]
+        dict for {pid started} $owned {
+            if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} {
+                catch {exec /bin/kill -$signal $pid}
+            }
+        }
+        after 200
+    }
+    foreach handle $handles {
+        catch {close -i $handle}
+        catch {wait -i $handle}
+    }
+    set table [processes]
+    dict for {pid started} $owned {
+        check {![dict exists $table $pid] || [lindex [dict get $table $pid] 1] ne $started} \
+            "owned process survived cleanup"
+    }
+    set owned [dict create]
+    set leaders {}
+    set handles {}
+    set startup_output ""
+    cd $original_cwd
+    if {$root ne ""} { file delete -force -- $root }
+    set root ""
+    set socket ""
+}
+proc drain {} {
+    global client startup_output
+    expect -i $client -timeout 0 -re {.+} {
+        set startup_output [string range "$startup_output$expect_out(0,string)" end-65535 end]
+    } timeout {} eof {error "attached tmux client exited"}
+    remember_tree
+}
+proc eventually {script message} {
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        drain
+        if {[uplevel 1 $script]} { return }
+        after 100
+    }
+    return -code error -errorcode {AFT CHECK} "timed out: $message"
+}
+proc clients {} {
+    return [llength [split [string trim [tm list-clients -F {#{client_pid}}]] \n]]
+}
+proc pane_pid {pane} { return [tm display-message -p -t $pane {#{pane_pid}}] }
+proc ready {harness pane} {
+    global startup_output root
+    # Capture only in memory for assertions; never print/save a TUI or transcript.
+    set text [tm capture-pane -p -t $pane]
+    if {[tm display-message -p -t $pane {#{pane_dead}}] eq "1"} {
+        append text $startup_output [tm capture-pane -p -S -200 -t $pane]
+        # These are only logs the CLI itself created in this disposable HOME.
+        foreach log [concat [glob -nocomplain $root/claude/debug/*.txt] [glob -nocomplain $root/data/opencode/log/*.log]] {
+            set channel [open $log r]
+            seek $channel [expr {max(0, [file size $log] - 65536)}] start
+            append text [read $channel 65536]
+            close $channel
+        }
+        regsub -all {\033\[[0-?]*[ -/]*[@-~]} $text {} text
+        set category {}
+        # Only fixed diagnostic labels leave memory, never error text or paths.
+        foreach label {
+            EPERM EACCES ENOENT EADDRINUSE EISDIR EPIPE ENOTFOUND ECONNREFUSED
+            listen bind connect mkdir open write read hosts tty CFPreferences
+            managed-settings keychain Unexpected authentication spawn bare SIMPLE
+        } {
+            if {[regexp -nocase -- "\\m$label\\M" $text]} { lappend category $label }
+        }
+        if {[regexp {(?:open\s+|path:\s*)["'](/[^"'\r\n]+)["']} $text ignored path]} {
+            if {[string first $root $path] == 0} {
+                lappend category target:private-root
+                set component [lindex [file split [string range $path [expr {[string length $root] + 1}] end]] 0]
+                if {$component in {home config data state cache runtime sockets tmp claude-tmp claude opencode codex protected-probe}} {
+                    lappend category private:$component
+                }
+                if {[file exists $path]} { lappend category type:[file type $path] }
+            } else {
+                switch -glob -- $path {
+                    /Users/* { lappend category target:real-home }
+                    /dev/* { lappend category target:device }
+                    /private/var/* { lappend category target:system-var }
+                    /private/tmp/* - /tmp/* { lappend category target:shared-temp }
+                    /Library/* { lappend category target:system-library }
+                    default { lappend category target:other }
+                }
+            }
+        }
+        return -code error -errorcode {AFT CHECK} \
+            "CLI exited before home/onboarding (exit=[tm display-message -p -t $pane {#{pane_dead_status}}], category=$category)"
+    }
+    if {$harness eq "claude"} {
+        return [expr {[string first "Claude Code" $text] >= 0 &&
+            [regexp -nocase {text style|dark mode|select.*theme|let.s get started} $text]}]
+    }
+    if {$harness eq "codex"} {
+        # Pinned upstream tui/src/onboarding/auth.rs, PickMode. Never select a
+        # login method, enter a key, accept trust, or advance to a model session.
+        return [expr {[string first "Sign in with ChatGPT" $text] >= 0 &&
+            [regexp {Sign in with Device Code|Provide your own API key|Use an OpenAI API key} $text]}]
+    }
+    return [regexp -nocase {ask anything|ask a question|connect a provider|select a provider} $text]
+}
+proc decision {pane} {
+    global env binary socket
+    set env(TMUX_PANE) $pane
+    set failed [catch {exec $binary doctor --socket $socket} result options]
+    unset env(TMUX_PANE)
+    if {$failed} { return -options $options $result }
+    check {[string first "explicit mappings=0" $result] >= 0} "unexpected harness mapping"
+    check {[regexp -line {^Current pane: (.+)$} $result ignored reason]} "missing inspection result"
+    return $reason
+}
+proc f7 {} {
+    global client
+    send -i $client -- "\033\[18~"
+}
+
+set root ""
+set socket ""
+set owned [dict create]
+set leaders {}
+set handles {}
+set original_cwd [pwd]
+trap {catch {teardown}; puts stderr "STOP: interrupted or test deadline exceeded; cleanup attempted"; exit 1} \
+    {SIGINT SIGTERM SIGHUP SIGUSR1}
+
+if {[catch {
+    check {$argc >= 1 && $argc <= 4} \
+        "usage: expect -N -n tests/actual_harness_smoke.exp BINARY \[CLAUDE \[OPENCODE \[CODEX\]\]\]"
+    check {$tcl_platform(os) eq "Darwin" && [file executable /usr/bin/sandbox-exec]} \
+        "no-model isolation requires macOS sandbox-exec; refusing to launch"
+    # Snapshot all paths BEFORE clearing HOME/PATH or changing cwd. Do not copy,
+    # rename, wrap, or map the installed harness executable into a fake layout.
+    set binary [absolute_executable [lindex $argv 0]]
+    set tmux [absolute_executable [lindex [auto_execok tmux] 0]]
+    set expect_binary [absolute_executable [info nameofexecutable]]
+    set inherited_path $env(PATH)
+    set private_paths {
+        /Users /home /root /private/tmp /Library/Keychains /Library/Preferences
+        /Library/Managed\ Preferences /Library/Application\ Support/ClaudeCode
+        /private/etc/claude-code /private/etc/codex /private/etc/xdg /opt/homebrew/etc/opencode
+    }
+    foreach name {
+        HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
+        CLAUDE_CONFIG_DIR OPENCODE_CONFIG_DIR OPENCODE_CONFIG OPENCODE_TUI_CONFIG CODEX_HOME
+    } {
+        if {[info exists env($name)] && $env($name) ne ""} {
+            lappend private_paths [file normalize $env($name)]
+        }
+    }
+    set harnesses [dict create]
+    foreach harness {claude opencode codex} index {1 2 3} {
+        set path [lindex $argv $index]
+        if {$path eq ""} { set path [lindex [auto_execok $harness] 0] }
+        if {$path ne "" && $path ne "-"} { set path [absolute_executable $path] }
+        dict set harnesses $harness $path
+    }
+    set codex_node ""
+    set codex_packages {}
+    set codex_path [dict get $harnesses codex]
+    if {[regexp {^(.*/node_modules/@openai/codex(?:-darwin-(?:arm64|x64))?)/} $codex_path ignored package]} {
+        lappend codex_packages $package
+        if {[string match */node_modules/@openai/codex/bin/codex.js $codex_path]} {
+            set codex_node [absolute_executable [lindex [auto_execok node] 0]]
+            foreach package [glob -nocomplain -types d -directory [file dirname $package] codex-darwin-arm64 codex-darwin-x64] {
+                lappend codex_packages [file normalize $package]
+            }
+        }
+    }
+}]} {
+    puts stderr "STOP: invalid arguments, missing executable, or isolation unavailable"
+    exit 1
+}
+
+set gaps 0
+set tested 0
+foreach harness {claude opencode codex} {
+    set executable [dict get $harnesses $harness]
+    if {$executable eq "" || $executable eq "-"} {
+        puts "SKIP $harness: absent or explicitly skipped; nothing installed"
+        continue
+    }
+    set invocation [list $executable]
+    if {$harness eq "codex" && $codex_node ne ""} {
+        set invocation [list $codex_node $executable]
+    }
+    set stage isolation
+    set failed [catch {
+        # Unset entries individually: array unset env loses Tcl's export trace.
+        foreach name [array names env] { unset env($name) }
+        set env(PATH) $inherited_path
+        set root [file normalize [exec /usr/bin/mktemp -d /private/tmp/aft-actual.XXXXXXXX]]
+        file attributes $root -permissions 0700
+        foreach {name directory} {
+            HOME home XDG_CONFIG_HOME config XDG_DATA_HOME data
+            XDG_STATE_HOME state XDG_CACHE_HOME cache XDG_RUNTIME_DIR runtime
+            TMUX_TMPDIR sockets TMPDIR tmp CLAUDE_CODE_TMPDIR claude-tmp CLAUDE_CONFIG_DIR claude
+            OPENCODE_CONFIG_DIR opencode CODEX_HOME codex
+        } {
+            set env($name) [file join $root $directory]
+            file mkdir $env($name)
+            file attributes $env($name) -permissions 0700
+        }
+        set env(TERM) xterm-256color
+        set env(SHELL) /bin/bash
+        set env(HISTFILE) /dev/null
+        set env(INPUTRC) /dev/null
+        set env(PS1) {AFT_PRIVATE_SHELL> }
+        foreach name {
+            DISABLE_AUTOUPDATER CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+            CLAUDE_CODE_SIMPLE
+            CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL
+            OPENCODE_DISABLE_AUTOUPDATE OPENCODE_DISABLE_MODELS_FETCH OPENCODE_PURE
+            OPENCODE_DISABLE_DEFAULT_PLUGINS OPENCODE_DISABLE_LSP_DOWNLOAD
+            OPENCODE_DISABLE_CLAUDE_CODE
+        } { set env($name) 1 }
+        cd $root
+        set socket [file join $env(TMUX_TMPDIR) server]
+        # Deny real home/config trees, keychains, managed config, and parent temp
+        # config discovery. System runtime reads remain available for native CLIs.
+        # Only private UNIX sockets are allowed; all IP networking is denied.
+        set profile {(version 1)
+            (allow default)
+            (deny network*)
+            (deny file-write*)
+            (allow file-write* (subpath "/dev"))
+            (deny mach-lookup
+                (global-name "com.apple.securityd")
+                (global-name "com.apple.cfprefsd.agent")
+                (global-name "com.apple.cfprefsd.daemon"))}
+        foreach path $private_paths {
+            append profile "\n(deny file-read-data (subpath [sbquote $path]))"
+        }
+        # A wildcard file-read* grant does not override the explicit data denial
+        # above. Match that operation for the fresh private root, not real homes.
+        append profile "\n(allow file-read-data file-read-metadata file-write* (subpath [sbquote $root]))"
+        foreach path [concat [list $binary $tmux $expect_binary] $invocation] {
+            append profile "\n(allow file-read-data (literal [sbquote $path]))"
+            # Native loaders may open ancestor directories. Literal directory
+            # access does not grant access to config/credential files beneath them.
+            for {set parent [file dirname $path]} {$parent ne "/"} {set parent [file dirname $parent]} {
+                append profile "\n(allow file-read-data (literal [sbquote $parent]))"
+            }
+        }
+        if {$harness eq "codex"} {
+            # Original npm wrapper/platform resources only; installation writes
+            # and all real user config/credential paths remain prohibited.
+            foreach package $codex_packages {
+                append profile "\n(allow file-read-data (subpath [sbquote $package]))"
+            }
+        }
+        append profile "\n(allow file-read-data (literal \"/private/tmp\"))"
+        append profile "\n(allow network* (local unix-socket (subpath [sbquote $root])) (remote unix-socket (subpath [sbquote $root])))"
+        set protected_probe [file join $root protected-probe]
+        close [open $protected_probe {WRONLY CREAT EXCL} 0600]
+        append profile "\n(deny file-read-data (literal [sbquote $protected_probe]))"
+        set sandbox [list /usr/bin/sandbox-exec -p $profile]
+        # A separate watchdog also bounds a blocked synchronous exec on Tcl 8.5.
+        spawn -noecho /bin/bash --noprofile --norc -c {/bin/sleep 90; /bin/kill -USR1 "$1"} aft [pid]
+        lappend handles $spawn_id
+        lappend leaders [exp_pid -i $spawn_id]
+        remember_tree
+        # Probe a private local TCP listener, not an internet/provider endpoint.
+        # Requiring EPERM/EACCES distinguishes sandbox denial from connection refusal.
+        set listener [socket -server {apply {{channel args} {close $channel}}} -myaddr 127.0.0.1 0]
+        set port [lindex [fconfigure $listener -sockname] 2]
+        set probe [format {
+            if {![catch {socket 127.0.0.1 %d} msg opts]} {exit 1}
+            if {[lindex [dict get $opts -errorcode] 1] ni {EPERM EACCES}} {exit 2}
+            if {![catch {open %s r} msg opts]} {exit 3}
+            if {[lindex [dict get $opts -errorcode] 1] ni {EPERM EACCES}} {exit 6}
+            close [open /private/etc/hosts r]
+            if {![catch {socket -server {apply {{channel args} {close $channel}}} -myaddr 127.0.0.1 0} msg opts]} {exit 5}
+            if {[lindex [dict get $opts -errorcode] 1] ni {EPERM EACCES}} {exit 6}
+            set writable %s
+            close [open $writable {WRONLY CREAT EXCL} 0600]
+            close [open $writable r]
+            file delete -- $writable
+            # Pipe stderr: Tcl 8.5's default exec stderr tempfile is outside HOME.
+            if {[catch {exec /bin/bash --noprofile --norc -c {exec 3<"$CLAUDE_CODE_TMPDIR"} 2>@1}]} {exit 4}
+            puts ISOLATED
+        } $port [list $protected_probe] [list [file join $env(CLAUDE_CODE_TMPDIR) write-probe]]]
+        set probe_failed [catch {exec {*}$sandbox $expect_binary -N -n -c $probe} probe_result probe_options]
+        close $listener
+        set probe_status ""
+        if {$probe_failed && [dict exists $probe_options -errorcode]} {
+            set probe_status [dict get $probe_options -errorcode]
+        }
+        check {!$probe_failed && $probe_result eq "ISOLATED"} "isolation probe failed ($probe_status); refusing TUI launch"
+        file delete -- $protected_probe
+        set stage version
+        spawn -noecho {*}$sandbox {*}$invocation --version
+        set version_handle $spawn_id
+        lappend handles $spawn_id
+        lappend leaders [exp_pid -i $spawn_id]
+        remember_tree
+        expect -i $version_handle eof {
+            set version_output $expect_out(buffer)
+        } timeout { error "version probe timed out" }
+        set status [wait -i $version_handle]
+        set category [regexp -inline {EPERM|EACCES|ENOENT|Operation not permitted|Permission denied|sandbox-exec} $version_output]
+        check {[lindex $status 2] == 0 && [lindex $status 3] == 0 && [llength $status] == 4} \
+            "version probe failed (exit=[lindex $status 3], signal=[lindex $status 5], category=$category)"
+        set index [lsearch -exact $handles $version_handle]
+        set handles [lreplace $handles $index $index]
+        check {[regexp {\m(\d+\.\d+\.\d+)\M} $version_output ignored version]} "missing version"
+        set expected [dict get {claude 2.1.263 opencode 1.18.29 codex 0.153.4} $harness]
+        check {$version eq $expected} "unreviewed harness version; refusing TUI launch"
+        puts "$harness $version: $executable"
+        puts "[exec $tmux -V]: $tmux; engine: $binary"
+
+        set stage startup
+        # Sandbox the CLI tree, not tmux's PTY allocation or the engine inspector.
+        # -D keeps our server in the foreground, giving cleanup a known tree root.
+        spawn -noecho $tmux -D -S $socket -f /dev/null
+        lappend handles $spawn_id
+        lappend leaders [exp_pid -i $spawn_id]
+        remember_tree
+        set deadline [expr {[clock milliseconds] + 5000}]
+        while {![file exists $socket] && [clock milliseconds] < $deadline} { after 50 }
+        check {[file exists $socket]} "private server failed to start"
+        # sandbox-exec replaces itself with the original CLI in the same PID;
+        # there is no framework or surviving wrapper, and no harness_paths map.
+        set stage new-pane
+        tm set-option -gw remain-on-exit on
+        tm set-option -g default-shell /bin/bash
+        tm set-option -g default-terminal xterm-256color
+        tm new-session -d -s outer -x 120 -y 40 -c $root /bin/sleep 90
+        tm set-option -g status off
+        tm set-option -g escape-time 100
+        set outer [tm display-message -p -t outer: {#{pane_id}}]
+        set stage bind
+        exec $binary bind --socket $socket
+        set stage attach
+        spawn -noecho $tmux -S $socket attach-session -t outer
+        set client $spawn_id
+        set startup_output ""
+        lappend handles $client
+        lappend leaders [exp_pid -i $client]
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        eventually {expr {[clients] == 1}} "attach"
+        # Attach before exec so even an immediately cleared startup error is
+        # available to the bounded, in-memory diagnostic classifier.
+        tm respawn-pane -k -t $outer -c $root {*}$sandbox {*}$invocation
+        set outer_pid [pane_pid $outer]
+        set stage home/onboarding
+        eventually {ready $harness $outer} "home/onboarding (no input sent)"
+        # Let transient startup children settle before measuring recognition.
+        for {set n 0} {$n < 10} {incr n} { drain; after 100 }
+        set reason [decision $outer]
+        set stage F7
+        f7
+        if {$reason ni {"recognized interactive foreground harness" "recognized interactive wrapper/native frontend pair"}} {
+            for {set n 0} {$n < 10} {incr n} { drain; after 100 }
+            check {[clients] == 1 && [pane_pid $outer] eq $outer_pid} "ineligible pane changed"
+            check {[decision $outer] eq $reason} "inspection changed during refusal"
+            puts "GAP $harness: home/onboarding reached; F7 conservatively refused ($reason); outer PID $outer_pid unchanged"
+            incr gaps
+        } else {
+            eventually {expr {[clients] == 2}} "F7 opens persistent shell"
+            set panes [split [string trim [tm list-panes -a -F {#{pane_id}}]] \n]
+            check {[llength $panes] == 2} "expected exactly one floating shell"
+            set float [lindex $panes [expr {[lindex $panes 0] eq $outer ? 1 : 0}]]
+            set float_pid [pane_pid $float]
+            eventually {expr {[tm display-message -p -t $float {#{pane_current_command}}] eq "bash"}} "floating shell ready"
+            f7
+            eventually {expr {[clients] == 1}} "F7 hides shell"
+            check {[pane_pid $float] eq $float_pid && [pane_pid $outer] eq $outer_pid} "hide replaced a process"
+            check {[decision $outer] eq $reason && [ready $harness $outer]} "outer harness changed"
+            f7
+            eventually {expr {[clients] == 2}} "F7 reopens shell"
+            check {[pane_pid $float] eq $float_pid && [pane_pid $outer] eq $outer_pid} "reopen replaced a process"
+            f7
+            eventually {expr {[clients] == 1}} "final F7 hides shell"
+            check {[pane_pid $float] eq $float_pid && [pane_pid $outer] eq $outer_pid} "final hide replaced a process"
+            check {[decision $outer] eq $reason && [ready $harness $outer]} "outer harness no longer at home/onboarding"
+            puts "PASS $harness: official layout, zero mappings, F7 open/hide/reopen/hide; outer PID $outer_pid and shell PID $float_pid unchanged"
+        }
+    } message options]
+    set cleanup_failed [catch {teardown}]
+    if {$failed || $cleanup_failed} {
+        # Error payloads can contain child output. Never print them or a screen dump.
+        puts stderr "STOP $harness: stage=$stage; failed=$failed; cleanup_failed=$cleanup_failed; no further harnesses launched"
+        if {$failed && [dict exists $options -errorcode] && [dict get $options -errorcode] eq "AFT CHECK"} {
+            puts stderr $message
+        }
+        exit 1
+    }
+    puts "PASS $harness isolation/cleanup: IP denied, private environment/state, owned process tree removed"
+    incr tested
+}
+if {$gaps} {
+    puts "RESULT: incomplete actual-harness coverage ($gaps gap(s)); not a full smoke pass"
+    exit 2
+}
+if {!$tested} {
+    puts "RESULT: skipped; no reviewed harness selected or installed"
+    exit 0
+}
+puts "RESULT: available reviewed harnesses passed; absent binaries skipped; no model interaction tested"

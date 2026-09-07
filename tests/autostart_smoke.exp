@@ -1,0 +1,250 @@
+#!/usr/bin/env expect
+# expect -N -n tests/autostart_smoke.exp /path/to/agent-float-term
+# Real installed payload/template, private HOME and exact private tmux sockets only.
+set timeout 15
+log_user 0
+if {$argc != 1} {
+    puts stderr "usage: expect -N -n tests/autostart_smoke.exp /path/to/agent-float-term"
+    exit 1
+}
+set source_binary [file normalize [lindex $argv 0]]
+foreach tool {tmux zsh bash} {
+    if {[auto_execok $tool] eq ""} { puts stderr "autostart smoke requires $tool"; exit 1 }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok zsh] 0]
+set bash [lindex [auto_execok bash] 0]
+set root ""
+set sockets {}
+set viewers {}
+set socket ""
+set client ""
+set original_cwd [pwd]
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc write_private {path contents} {
+    set out [open $path {WRONLY CREAT TRUNC} 0600]
+    puts $out $contents
+    close $out
+}
+proc contents {path} {
+    set input [open $path r]
+    set text [read $input]
+    close $input
+    return $text
+}
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket {*}$args]
+}
+proc binding {} {
+    foreach line [split [tm list-keys] \n] {
+        if {[regexp {^bind-key +(?:-r +)?-T +root +F7 +} $line]} { return $line }
+    }
+    return ""
+}
+proc eventually {script message} {
+    global client
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        if {[uplevel 1 $script]} { return }
+        expect -i $client -timeout 0 -re {.+} {} timeout {} eof {error "client exited: $message"}
+        after 50
+    }
+    error "timed out: $message"
+}
+proc contains {pane text} {
+    return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}]
+}
+proc attached {} {
+    if {[catch {tm list-clients -F {#{client_pid}}} listing]} { return 0 }
+    return [expr {[llength [split [string trim $listing]]] == 1}]
+}
+proc finish {viewer seconds} {
+    global viewers
+    expect -i $viewer -timeout $seconds eof {} timeout {error "shell command exceeded ${seconds}s exit bound"}
+    set output $expect_out(buffer)
+    set status [wait -i $viewer]
+    set viewers [lsearch -all -inline -not -exact $viewers $viewer]
+    check {[lindex $status 2] == 0 && [lindex $status 3] == 0} "shell failed: $status"
+    return [string map [list \r ""] $output]
+}
+proc teardown {} {
+    global root sockets viewers tmux original_cwd
+    # Includes the dedicated socket even if an erroneous command-mode start made it.
+    foreach path $sockets {
+        if {[file exists $path]} { catch {exec $tmux -S $path kill-server} }
+    }
+    foreach viewer $viewers {
+        catch {close -i $viewer}
+        catch {wait -i $viewer}
+    }
+    cd $original_cwd
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+
+set failed [catch {
+    set root [file normalize [exec mktemp -d /tmp/aft-auto.XXXXXXXX]]
+    file attributes $root -permissions 0700
+    # Snapshot before installation; shared cargo artifacts may change during this run.
+    set binary [file join $root agent-float-term]
+    file copy $source_binary $binary
+    file attributes $binary -permissions 0700
+    set inherited_path $env(PATH)
+    # Preserve Tcl's export trace. Do not inherit SHLVL or user shell/tool settings.
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) $inherited_path
+    set env(HOME) [file join $root home]
+    set env(ZDOTDIR) [file join $root zsh]
+    set env(XDG_CONFIG_HOME) [file join $root config]
+    set env(XDG_DATA_HOME) [file join $root data]
+    set env(XDG_STATE_HOME) [file join $root state]
+    set env(XDG_RUNTIME_DIR) [file join $root runtime]
+    set env(TMUX_TMPDIR) [file join $root sockets]
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    foreach directory [list $env(HOME) $env(ZDOTDIR) $env(XDG_CONFIG_HOME) $env(XDG_DATA_HOME) $env(XDG_STATE_HOME) $env(XDG_RUNTIME_DIR) $env(TMUX_TMPDIR)] {
+        file mkdir $directory
+        file attributes $directory -permissions 0700
+    }
+    cd $env(HOME)
+    set dedicated [file join $env(XDG_RUNTIME_DIR) agent-float-term-[exec id -u]]
+    set dedicated_socket [file join $dedicated tmux.sock]
+    set socket [file join $env(TMUX_TMPDIR) existing]
+    set sockets [list $socket $dedicated_socket]
+    set rc [file join $root temp.zshrc]
+    write_private $rc {PS1='AFT_HUMAN_PROMPT> '
+unsetopt zle prompt_cr prompt_sp
+}
+    exec $binary install --shell-config $rc --shell-kind zsh --yes 2>@1
+    set installed [file join $env(HOME) .local bin agent-float-term]
+    check {[file executable $installed]} "installer did not publish its payload"
+    check {[exec $installed --version] eq [exec $binary --version]} "installed payload version differs"
+    check {![file exists [file join $env(XDG_CONFIG_HOME) agent-float-term config.toml]]} "test must use default application configuration"
+    set observed [file join $env(HOME) rc-observed]
+    # Only this disposable rc is sourced, never the real user's .zshrc.
+    write_private [file join $env(ZDOTDIR) .zshrc] "source '$rc'\n[string trim {
+print -r -- "rc:$-:${+functions[__aft_initialize]}:${_AFT_AUTO_STARTED-unset}" >> "$HOME/rc-observed"
+}]"
+
+    # PTYs keep both descriptors interactive so a missing command guard really starts
+    # tmux instead of being accidentally masked by the non-TTY guard.
+    set cases [list [list -ic :] [list -lic :] [list -ic ""] [list -lic ""]]
+    set source "source '$env(ZDOTDIR)/.zshrc'"
+    lappend cases [list -c "$source; print -r -- AFT_SNAPSHOT_OK"]
+    lappend cases [list -c "( $source; print -r -- AFT_SNAPSHOT_OK ) & wait"]
+    foreach args $cases {
+        file delete -force -- $observed
+        set started [clock milliseconds]
+        spawn -noecho $shell {*}$args
+        set viewer $spawn_id
+        lappend viewers $viewer
+        set output [finish $viewer 5]
+        set elapsed [expr {[clock milliseconds] - $started}]
+        check {$elapsed < 5000} "zsh $args took ${elapsed}ms (limit 5000ms)"
+        set expected ""
+        if {[lindex $args 0] eq "-c"} { set expected "AFT_SNAPSHOT_OK\n" }
+        check {$output eq $expected} "zsh $args polluted command/snapshot stdout: $output"
+        check {[regexp {^rc:([^:]*):0:unset\n$} [contents $observed] ignored flags]} "command mode registered a hook or attempted autostart"
+        check {[expr {[string first i $flags] >= 0}] == [expr {[lindex $args 0] ne "-c"}]} "shell flags do not match the tested invocation"
+        check {![file exists $dedicated]} "command mode created dedicated socket/ownership artifacts"
+        check {[glob -nocomplain -directory $env(TMUX_TMPDIR) *] eq {}} "command mode created a tmux socket"
+        puts "Autostart guard passed: zsh $args (${elapsed}ms)"
+    }
+
+    # Approximate instant prompt without loading Powerlevel10k: its earlier precmd
+    # hook restores all descriptors before the installed one-shot hook runs.
+    set installed_rc [contents $rc]
+    write_private $rc "[string trim {
+exec 3<&0 4>&1 5>&2 </dev/null > "$HOME/instant-output" 2>&1
+fixture_restore() {
+    exec 0<&3 1>&4 2>&5 3<&- 4>&- 5>&-
+    precmd_functions=("${precmd_functions[@]:#fixture_restore}")
+    print -r -- restored >> "$HOME/prompt-observed"
+}
+precmd_functions=(fixture_restore)
+}]\n$installed_rc"
+    # zsh needs stdin restored before leaving rc to reach its first human prompt.
+    write_private [file join $env(ZDOTDIR) .zshrc] "source '$rc'\nexec 0<&3\n"
+    tm -f /dev/null new-session -d -s existing -c $env(HOME) $bash --noprofile --norc -i
+    tm set-option -g status off
+    tm set-option -g escape-time 100
+    check {[binding] eq ""} "private server unexpectedly has a default root F7 binding"
+    set pane [tm display-message -p -t existing: {#{pane_id}}]
+    spawn -noecho $tmux -S $socket attach-session -t existing
+    set client $spawn_id
+    lappend viewers $client
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached} "private existing server attached"
+    send -i $client -- "exec '$shell' -i\r"
+    eventually {contains $pane "AFT_HUMAN_PROMPT>"} "first human prompt after redirected rc"
+    set owned [binding]
+    check {$owned ne "" && [string first $installed $owned] >= 0} "first prompt did not automatically bind F7 to the installed payload"
+    check {[contents [file join $env(HOME) prompt-observed]] eq "restored\n"} "earlier prompt hook did not run exactly once"
+    check {[contents [file join $env(HOME) instant-output]] eq ""} "autostart polluted instant-prompt output"
+    check {![contains $pane "Already inside tmux"] && ![contains $pane "Bound F7"] && ![contains $pane "startup failed"]} "AFT_QUIET startup was not silent"
+    check {![file exists $dedicated]} "existing-server startup created a nested dedicated server"
+    check {[tm list-panes -a -F {#{pane_id}}] eq $pane} "autostart created another pane"
+    set pid [tm display-message -p -t $pane {#{pane_pid}}]
+    # A normal shell still receives F7; no explicit bind command is used anywhere.
+    send -i $client -- {printf 'AFT_READ_%s\n' READY; key=''; read -r -s -k 5 key; [[ $key == $'\e[18~' ]] && printf 'AFT_F7_%s\n' PASS}
+    send -i $client -- "\r"
+    eventually {contains $pane AFT_READ_READY} "shell waiting for automatically bound F7"
+    send -i $client -- "\033\[18~"
+    eventually {contains $pane AFT_F7_PASS} "automatic F7 dispatch preserves ordinary-shell passthrough"
+    send -i $client -- {printf 'AFT_HOOK_%s:%s\n' "${+functions[__aft_initialize]}" "${_AFT_AUTO_STARTED-unset}"}
+    send -i $client -- "\r"
+    eventually {contains $pane AFT_HOOK_0:1} "one-shot startup hook removed after first prompt"
+    check {[binding] eq $owned} "later prompts changed the owned binding"
+    check {[tm display-message -p -t $pane {#{pane_pid}}] eq $pid} "automatic binding replaced the user's shell"
+    send -i $client -- "exit\r"
+    finish $client 15
+    set client ""
+
+    # Outside tmux, an ordinary human shell must attach to its own dedicated server
+    # with F7 ready at the first usable prompt, without any user configuration.
+    write_private $rc $installed_rc
+    write_private [file join $env(ZDOTDIR) .zshrc] "source '$rc'"
+    set socket $dedicated_socket
+    spawn -noecho $shell -i
+    set client $spawn_id
+    lappend viewers $client
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached} "ordinary zsh automatically attaches dedicated server"
+    set pane [tm list-panes -a -F {#{pane_id}}]
+    check {[llength [split $pane]] == 1} "ordinary startup created extra panes"
+    eventually {contains $pane "AFT_HUMAN_PROMPT>"} "dedicated shell's first usable prompt"
+    check {[binding] ne "" && [string first $installed [binding]] >= 0} "dedicated first prompt has no installed F7 binding"
+    set marker [file join $dedicated tmux.owner]
+    check {[file type $marker] eq "file" && ([file attributes $marker -permissions] & 0077) == 0} "dedicated ownership marker is not private"
+    set generation [contents $marker]
+    check {[regexp {^[0-9a-fA-F]{32}$} $generation]} "dedicated ownership marker is invalid"
+    check {[tm show-options -gqv @aft_generation] eq $generation && [tm show-options -gqv @aft_dedicated] eq "1"} "dedicated server ownership does not match its marker"
+    send -i $client -- {printf 'AFT_DEDICATED_%s:%s\n' "${AFT_DISABLE-unset}" "${AFT_QUIET-unset}"}
+    send -i $client -- "\r"
+    eventually {contains $pane AFT_DEDICATED_1:} "dedicated ordinary shell accepts input with recursion guard"
+    check {![contains $pane "startup failed"]} "dedicated automatic startup failed"
+    send -i $client -- "\002d"
+    # Consume the detach notice first, not an older prompt buffered by the client.
+    expect -i $client -timeout 15 -re {\[detached[^\r\n]*\]} {} timeout {error "dedicated client did not detach"} eof {error "original zsh exited on detach"}
+    expect -i $client -timeout 15 -re {AFT_HUMAN_PROMPT>} {} timeout {error "detaching did not return to original zsh"} eof {error "original zsh exited on detach"}
+    send -i $client -- "exit\r"
+    finish $client 15
+    set client ""
+} message options]
+if {$failed} {
+    puts stderr "Autostart smoke FAILED: $message"
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+    if {$socket ne "" && [file exists $socket]} {
+        catch {
+            foreach pane [split [tm list-panes -a -F {#{pane_id}}] \n] {
+                puts stderr "private pane $pane:\n[tm capture-pane -p -t $pane]"
+            }
+        }
+    }
+}
+teardown
+if {$failed} { exit 1 }
+puts "Autostart smoke passed: installed zsh hook, command/empty-command/snapshot guards under 5s, silent first-prompt F7 after descriptor restoration, ordinary-shell dedicated autostart"

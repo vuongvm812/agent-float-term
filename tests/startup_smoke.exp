@@ -1,0 +1,268 @@
+#!/usr/bin/env expect
+# Independent entry point: expect tests/startup_smoke.exp /path/to/agent-float-term
+# Uses only ordinary shells, never starts a harness, and kills only its private server.
+set timeout 15
+log_user 0
+if {$argc != 1} {
+    puts stderr "usage: expect tests/startup_smoke.exp /path/to/agent-float-term"
+    exit 1
+}
+set source_binary [file normalize [lindex $argv 0]]
+foreach tool {tmux bash} {
+    if {[auto_execok $tool] eq ""} {
+        puts stderr "startup smoke requires $tool"
+        exit 1
+    }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok bash] 0]
+set root ""
+set socket ""
+set viewers {}
+set original_cwd [pwd]
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket {*}$args]
+}
+proc eventually {script message} {
+    global viewers
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        if {[uplevel 1 $script]} { return }
+        foreach viewer $viewers {
+            expect -i $viewer -timeout 0 -re {.+} {} timeout {} eof {error "start exited unexpectedly"}
+        }
+        after 50
+    }
+    error "timed out: $message"
+}
+proc attached {count} {
+    if {[catch {tm list-clients -F {#{client_pid}}} listing]} { return 0 }
+    return [expr {[llength [split [string trim $listing]]] == $count}]
+}
+proc contains {pane text} {
+    return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}]
+}
+proc owned_generation {} {
+    global dedicated
+    set marker [file join $dedicated tmux.owner]
+    check {[file type $marker] eq "file"} "dedicated ownership marker is not a regular file"
+    check {([file attributes $marker -permissions] & 0077) == 0} "dedicated ownership marker is not private"
+    set input [open $marker r]
+    set generation [read $input]
+    close $input
+    check {[regexp {^[0-9a-fA-F]{32}$} $generation]} "invalid dedicated ownership generation"
+    return $generation
+}
+proc finish {viewer expected} {
+    global viewers
+    expect {
+        -i $viewer -timeout 15
+        eof {}
+        timeout {error "start did not exit within 15 seconds"}
+    }
+    set status [wait -i $viewer]
+    set viewers [lsearch -all -inline -not -exact $viewers $viewer]
+    check {[lindex $status 2] == 0 && [lindex $status 3] == $expected} "unexpected start exit status: $status"
+}
+proc teardown {} {
+    global root socket tmux viewers original_cwd
+    if {$socket ne "" && [file exists $socket]} { catch {exec $tmux -S $socket kill-server} }
+    foreach viewer $viewers {
+        catch {close -i $viewer}
+        catch {wait -i $viewer}
+    }
+    cd $original_cwd
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+
+set failed [catch {
+    set root [file normalize [exec mktemp -d /tmp/aft-start.XXXXXXXX]]
+    file attributes $root -permissions 0700
+    # Keep this run stable if another agent rebuilds the shared target artifact.
+    set binary [file join $root agent-float-term]
+    file copy $source_binary $binary
+    file attributes $binary -permissions 0700
+    set inherited_path $env(PATH)
+    # Preserve Tcl's trace so changes really reach exec/spawn children.
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) $inherited_path
+    set env(HOME) [file join $root home]
+    set env(XDG_CONFIG_HOME) [file join $root config]
+    set env(XDG_DATA_HOME) [file join $root data]
+    set env(XDG_STATE_HOME) [file join $root state]
+    set env(XDG_RUNTIME_DIR) [file join $root runtime]
+    set env(TMUX_TMPDIR) [file join $root sockets]
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set work [file join $root {cwd #{pane_id} $value}]
+    foreach directory [list $env(HOME) $env(XDG_CONFIG_HOME) $env(XDG_DATA_HOME) $env(XDG_STATE_HOME) $env(XDG_RUNTIME_DIR) $env(TMUX_TMPDIR) $work] {
+        file mkdir $directory
+        file attributes $directory -permissions 0700
+    }
+    set config_dir [file join $env(XDG_CONFIG_HOME) agent-float-term]
+    file mkdir $config_dir
+    file attributes $config_dir -permissions 0700
+    set out [open [file join $config_dir config.toml] {WRONLY CREAT EXCL} 0600]
+    puts $out "shell = '$shell'"
+    close $out
+    set dedicated [file join $env(XDG_RUNTIME_DIR) agent-float-term-[exec id -u]]
+    set socket [file join $dedicated tmux.sock]
+    cd $work
+
+    set rejected [catch {exec $binary start < /dev/null 2>@1} output options]
+    check {$rejected && [lindex [dict get $options -errorcode] 2] == 1} "noninteractive start must fail with status 1"
+    check {[string first "requires an interactive terminal" $output] >= 0} "noninteractive refusal was not explicit"
+    check {![file exists $dedicated]} "noninteractive start created a dedicated server directory"
+
+    # Even at the expected socket path, an unowned server must not be adopted.
+    file mkdir $dedicated
+    file attributes $dedicated -permissions 0700
+    tm -f /dev/null new-session -d -s foreign -c $env(HOME) $shell --noprofile --norc -i
+    set foreign_before [tm list-panes -a -F {#{session_id}|#{pane_id}|#{pane_pid}}]
+    spawn -noecho $binary start
+    set refused $spawn_id
+    lappend viewers $refused
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    expect {
+        -i $refused -timeout 15
+        -re {socket is not an owned dedicated server} {}
+        timeout {error "unowned dedicated socket was not refused"}
+        eof {error "start exited without an ownership refusal"}
+    }
+    finish $refused 1
+    check {[tm list-panes -a -F {#{session_id}|#{pane_id}|#{pane_pid}}] eq $foreign_before} "start modified the unowned server"
+    check {[tm list-clients -F {#{client_pid}}] eq ""} "start attached to an unowned session"
+    tm kill-server
+    eventually {expr {[catch {tm list-sessions}]}} "private foreign server stopped"
+    if {[file exists $socket]} {
+        file stat $socket stale_before
+        spawn -noecho $binary start
+        set refused $spawn_id
+        lappend viewers $refused
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        expect {
+            -i $refused -timeout 15
+            -re {dead socket has no ownership evidence} {}
+            timeout {error "unowned dead socket was not refused"}
+            eof {error "start exited without a stale-socket ownership refusal"}
+        }
+        finish $refused 1
+        file stat $socket stale_after
+        check {$stale_after(ino) == $stale_before(ino) && $stale_after(dev) == $stale_before(dev)} "start replaced an unowned dead socket"
+        check {![file exists [file join $dedicated tmux.owner]]} "start created ownership evidence for an unowned socket"
+        check {[catch {tm list-sessions}]} "start created a server from an unowned dead socket"
+    }
+    # Remove only this unowned control socket to begin the clean-install scenario.
+    # The owned recovery scenarios below never remove or replace the dead socket.
+    file delete -- $socket
+
+    # No command after 'start': it opens a shell, not a wrapped or auto-started CLI.
+    spawn -noecho $binary start
+    set first $spawn_id
+    lappend viewers $first
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached 1} "first dedicated shell attached"
+    set first_pane [tm list-panes -a -F {#{pane_id}}]
+    check {[llength [split $first_pane]] == 1} "start created more than one shell pane"
+    set first_pid [tm display-message -p -t $first_pane {#{pane_pid}}]
+    set first_session [tm display-message -p -t $first_pane {#{session_id}}]
+    check {[tm display-message -p -t $first_pane {#{pane_current_command}}] eq [file tail $shell]} "start did not open an ordinary shell"
+    set first_client [tm list-clients -F {#{client_name}}]
+    send -i $first -- {printf 'AFT_START_%s:%s\n' "$PWD" "$AFT_DISABLE"}
+    send -i $first -- "\r"
+    eventually {contains $first_pane "AFT_START_$work:1"} "literal hash/dollar cwd and recursion guard"
+    check {[tm display-message -p -t $first_pane {#{pane_current_path}}] eq $work} "start expanded literal cwd characters"
+
+    # Running start inside that shell must not create a nested outer session.
+    send -i $first -- "'$binary' start\r"
+    eventually {contains $first_pane "Already inside tmux; no nested outer session was created."} "in-tmux start binds without nesting"
+    check {[tm list-panes -a -F {#{pane_id}}] eq $first_pane} "in-tmux start created another pane"
+
+    spawn -noecho $binary start
+    set second $spawn_id
+    lappend viewers $second
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached 2} "second start attached to reused owned server"
+    set second_pane ""
+    foreach pane [split [tm list-panes -a -F {#{pane_id}}] \n] {
+        if {$pane ne $first_pane} {
+            check {$second_pane eq ""} "second start created extra panes"
+            set second_pane $pane
+        }
+    }
+    check {$second_pane ne ""} "second start hijacked the first session"
+    set second_session [tm display-message -p -t $second_pane {#{session_id}}]
+    check {$second_session ne $first_session} "second start reused the first work session"
+    check {[lsearch -exact [split [tm list-clients -F {#{client_name}|#{session_id}}] \n] "$first_client|$first_session"] >= 0} "second start moved the original client"
+    check {[tm display-message -p -t $first_pane {#{pane_pid}}] eq $first_pid} "second start replaced the first shell"
+    send -i $second -- {printf 'AFT_SECOND_%s\n' "$PWD"}
+    send -i $second -- "\r"
+    eventually {contains $second_pane "AFT_SECOND_$work"} "second shell retains literal cwd"
+    send -i $first -- "printf 'AFT_FIRST_%s\\n' STILL_HERE\r"
+    eventually {contains $first_pane AFT_FIRST_STILL_HERE} "first client remains on its original shell"
+    check {![contains $second_pane AFT_FIRST_STILL_HERE]} "first client input went to second session"
+    send -i $second -- "\002d"
+    finish $second 0
+    send -i $first -- "\002d"
+    finish $first 0
+    tm has-session -t $first_session
+    tm has-session -t $second_session
+    check {[tm display-message -p -t $first_pane {#{pane_pid}}] eq $first_pid} "detach terminated dedicated shell"
+
+    set previous_generation [owned_generation]
+    check {[tm show-options -gqv @aft_generation] eq $previous_generation} "live generation differs from the private ownership marker"
+    set previous_pid $first_pid
+    # Failure injection is confined to our dedicated server. Its two detached
+    # work sessions are intentionally destroyed; neither socket nor marker is deleted.
+    tm kill-server
+    foreach recovery {killed-server last-shell-exit} {
+        eventually {expr {[catch {tm list-sessions}]}} "server stopped before $recovery recovery"
+        check {[owned_generation] eq $previous_generation} "server exit discarded the ownership marker"
+        if {[file exists $socket]} {
+            check {[file type $socket] eq "socket"} "dead owned socket is not a socket"
+        }
+        spawn -noecho $binary start
+        set recovered $spawn_id
+        lappend viewers $recovered
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        eventually {attached 1} "start recovers after $recovery without manual socket deletion"
+        set generation [owned_generation]
+        check {$generation ne $previous_generation} "$recovery reused the dead server generation"
+        check {[tm show-options -gqv @aft_generation] eq $generation} "recovered generation differs from the ownership marker"
+        check {[tm show-options -gqv @aft_dedicated] eq "1"} "recovered server is not marked dedicated"
+        set pane [tm list-panes -a -F {#{pane_id}}]
+        check {[llength [split $pane]] == 1} "recovery created extra shell panes"
+        set shell_pid [tm display-message -p -t $pane {#{pane_pid}}]
+        check {$shell_pid ne $previous_pid} "recovery did not create a fresh shell"
+        check {[tm display-message -p -t $pane {#{pane_current_command}}] eq [file tail $shell]} "recovery did not open a normal shell"
+        send -i $recovered -- {printf 'AFT_RECOVERED_%s:%s\n' "$PWD" "$AFT_DISABLE"}
+        send -i $recovered -- "\r"
+        eventually {contains $pane "AFT_RECOVERED_$work:1"} "recovered shell preserves literal cwd and recursion guard"
+        # With only this shell left, a normal exit must also permit a later start.
+        send -i $recovered -- "exit\r"
+        finish $recovered 0
+        set previous_generation $generation
+        set previous_pid $shell_pid
+    }
+    eventually {expr {[catch {tm list-sessions}]}} "final dedicated shell exited"
+} message options]
+if {$failed} {
+    puts stderr "Startup smoke FAILED: $message"
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+    if {$socket ne "" && [file exists $socket]} {
+        catch {puts stderr "clients: [tm list-clients]"}
+        catch {
+            foreach pane [split [tm list-panes -a -F {#{pane_id}}] \n] {
+                puts stderr "pane $pane:\n[tm capture-pane -p -t $pane]"
+            }
+        }
+    }
+}
+teardown
+if {$failed} { exit 1 }
+puts "Startup smoke passed: terminal guard, literal cwd, ordinary shells, owned reuse without takeover, unowned stale refusal, owned restart after kill/exit"

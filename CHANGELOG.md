@@ -1,0 +1,142 @@
+# Changelog
+
+Notable user-facing changes are recorded here. An entry under Unreleased is not
+evidence that the implementation or compatibility testing is complete.
+
+## Unreleased
+
+### F7 Latency And Terminal Theme
+
+- Batched runtime metadata and guarded mutations reduce warm-open tmux
+  invocations from 17 to 7, and post-hide worker cleanup from 3 to 1. Latest cold
+  creation uses 10, including a global-policy check added after the measured
+  nine-invocation revision. Orphan cleanup behavior is unchanged.
+- Cached client-version verification is tied to the executable metadata
+  fingerprint, selected path, server version, and server-global generation.
+  Binding checks the fingerprint before and after version verification; replaced
+  binaries require rechecking. Private per-server binding records retain an
+  optional approved client path for matching-client reuse across PATH changes.
+  A tmux 3.5a live server needs a matching client, not simply a newer one.
+- Read-only `doctor` reports the selected client path/version and last popup
+  failure cause. No client download or live-server restart is automatic.
+- Popup content and border explicitly use `fg=terminal,bg=terminal`, not tmux
+  `default`, which can inherit an opaque RGB style. Owned window/pane styles reset
+  to `none,fg=terminal,bg=terminal` on every open; global and parent styles remain
+  unchanged. Foreign-linked windows are refused before style mutation.
+- The inner attach client uses `-T RGB`, preserving explicit application colors.
+  Transparency remains emulator policy: no OS opacity changes or see-through
+  compositing of the underlying AI pane. Explicit application backgrounds remain
+  colored, and custom `pane-colours` palette overrides can affect the result.
+- Added actual-SGR positive/negative theme regression coverage, verified on
+  Linux tmux 3.3a and macOS 3.5a/3.7c. CI runs `tests/theme_smoke.exp` after
+  autostart, with its own five-minute timeout and `TERM=xterm-256color`.
+- Optional `tests/benchmark_toggle.exp` uses five cold and twenty-five warm
+  samples per version; it is not a CI threshold. macOS 3.5a warm attachment p50
+  improved 209.7 to 113.6 ms and prompt-frame p50 256.2 to 163.3 ms; 3.7c improved
+  218.2 to 116.6 ms and 263.5 to 162.1 ms respectively. On 3.5a hide was 9.8 to
+  10.2 ms (observation noise), and post-hide cleanup settled in 45.0 to 18.1 ms.
+  These are private clean-shell measurements, not the user's full-profile
+  roughly one-second F7 delay or a 100 ms end-to-end guarantee.
+- The benchmark's cold-read probe now acknowledges shell handoff before sending
+  input, avoiding readline prefetch. No Linux percentiles are reported because
+  the old probe failed there; revised cold-read timing is not directly baseline
+  comparable. See [benchmark scope](docs/compatibility.md#f7-benchmark).
+- Latest Linux Rust suite: 57 passed (50 library, 2 CLI, 1 installer, 4 tmux-client).
+  macOS full suite: 59 passed, including four `tmux_client` tests. All four
+  release smoke suites passed. Live F7 was confirmed before optimization; the
+  optimized revision is installed, with live visual/latency acceptance remaining.
+  The separate reported 2-5 second AI startup
+  delay remains unresolved and unmeasured; this is not an AI startup fix.
+
+### F7 And Autostart Fix
+
+- Fixed automatic initialization inside existing tmux: the reported default
+  tmux 3.5a server had no F7 binding because the old shell template skipped
+  `TMUX`. Human shells now call quiet `start`, which initializes/binds that
+  server without nesting an outer session or overwriting a foreign root key.
+- Foreground inspection now permits up to 64 group members: verified frontends
+  and descendant MCP/LSP or other helpers with pipe/socket or `/dev/null` stdin.
+  TTY stdout/stderr are allowed; any extra terminal FD at 3 or higher blocks
+  eligibility. Helper argv is not required outside frontend-pair recognition;
+  identity, executable, group, and relevant descriptor metadata are revalidated
+  within a 300 ms inspection budget.
+- Generated Bash integration initializes inline only in interactive real-TTY
+  shells. Zsh defers to a one-shot tail `precmd` hook after earlier Powerlevel10k
+  descriptor restoration, allowing one bounded retry. Execution-string setness
+  guards skip `-ic`/`-lic`, including empty commands, and script/snapshot execution;
+  SSH, non-TTY, disable, and recursion guards remain in place.
+- This fixes the demonstrated shell-snapshot attach-blocking mechanism, not a
+  measured resolution of every startup delay. The reported 2-5 second TUI startup
+  latency remains unmeasured.
+- `update` remains binary-only. `install --yes` refreshes owned generated
+  templates, retaining unselected configs and the recorded shell kind. No user
+  tmux config was changed; the pre-existing bad `default-terminal` was left intact.
+- Added `tests/autostart_smoke.exp` to CI with its own five-minute timeout and
+  `TERM=xterm-256color`, consistent with the other smoke steps.
+
+### Focused Bugfix Validation
+
+- macOS `tests/autostart_smoke.exp` passed using the actual installed binary and
+  a fake Powerlevel10k-style descriptor cleanup, not the user's prompt config.
+  Command/shell-snapshot checks took 31-44 ms with zero autostarts.
+- Core PTY coverage with workers, focused inspector tests, and focused installer
+  tests passed. These earlier focused results are separate from the latest
+  latency/theme validation and historical totals below.
+- Read-only `doctor` recognizes the user's current live Claude and OpenCode
+  invocations with helpers. Live F7 was subsequently confirmed before the latest
+  optimization; this is not model-interaction or generating-session acceptance.
+
+### 0.1.0 Release Candidate Scope
+
+- Harness Floating Terminal (`agent-float-term`): an F7 floating shell for
+  ordinary, unwrapped Claude Code, Codex, and OpenCode invocations in tmux.
+- Per-parent-pane shells with a single viewer, persistent detached jobs and cwd,
+  conservative foreground detection, and explicit orphan cleanup.
+- Preview-first installation; existing-server binding and an optional dedicated
+  tmux environment that starts a normal shell.
+- XDG TOML configuration for key, popup dimensions, shell, and harness paths.
+- Diagnostics, session inspection, explicit local SHA-256-verified updates,
+  rollback, and managed uninstall.
+- MIT licensing, contribution/security guidance, pinned Linux/macOS CI, and
+  manual native release packaging with archive checksums.
+- Separate Linux minimum tmux 3.3a and reference 3.7c CI lanes with verified
+  official archive hashes; core PTY, dedicated startup, autostart, and theme smoke steps.
+
+### Earlier Local Validation
+
+These results predate the latest F7/autostart fix; they do not establish that its
+final full-suite or packaged-binary reruns are complete.
+
+- macOS ARM64 fmt, Clippy, 48 Rust tests (45 library + 2 CLI + 1 integration), release build,
+  and native archive packaging passed. Core PTY and startup smoke passed against
+  both the final release engine and the packaged engine with tmux 3.7c.
+- Claude Code 2.1.263 SIMPLE and OpenCode 1.18.29 no-model smoke passed using
+  official paths, zero mappings, and unchanged PIDs with the release engine.
+- Codex 0.153.4 native and unmodified npm-wrapper launches passed no-model F7
+  open/hide/reopen/hide checks. The integrity-verified official npm package was
+  installed only temporarily with scripts disabled, then removed; no global
+  Codex installation remains.
+- Final Debian 12 aarch64 UID 0 Rust 1.84.1 checks passed: 45 tests (43 library +
+  2 CLI), Clippy, and build. Both core PTY and startup passed with private-prefix
+  tmux 3.3a and 3.7c after `AFT_TMUX_BINARY` pinned the client across login PATH
+  resets. Default `/tmp` startup ownership, generation, and shell exit also passed.
+- Unprivileged Debian 12 aarch64 execution passed all 46 Rust tests, including
+  the actual-CLI installer integration test. Installation, installed-symlink
+  reinvocation, updates, rollback and uninstall passed on macOS and Linux.
+  See [compatibility](docs/compatibility.md).
+
+### Validation Pending
+
+- Final macOS full-suite and release/packaged-binary reruns for the latest changes,
+  including all four required smoke tests.
+- GitHub Rust/core PTY/startup/autostart/theme matrix evidence and Intel/Linux x86_64
+  archive acceptance; earlier local ARM64 runs are not remote CI runs.
+- Latest deployment and live F7 latency/theme acceptance in the reported
+  Claude/OpenCode invocations; separate measurement of the unresolved reported
+  2-5 second TUI startup latency.
+- Authenticated/generating-session acceptance for all three harnesses.
+- WSL2 verification; Linux ARM64 remains source-build-only despite local evidence.
+- Eventual public-release download/install/update/rollback/uninstall acceptance. Local macOS archive
+  packaging and smoke checks are complete; no release is published.
+
+No published 0.1.0 release or completed validation matrix is asserted here.

@@ -1,0 +1,505 @@
+#!/usr/bin/env expect
+# Run from any directory: expect tests/pty_smoke.exp /path/to/agent-float-term
+# All keystrokes traverse an attached client's PTY, never tmux send-keys.
+# F7 assertions use normal key tables; copy mode and other modal tables are not universal bindings.
+set timeout 15
+log_user 0
+if {$argc != 1} {
+    puts stderr "usage: expect tests/pty_smoke.exp /path/to/agent-float-term"
+    exit 1
+}
+set source_binary [file normalize [lindex $argv 0]]
+set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
+foreach tool {tmux cc bash} {
+    if {[auto_execok $tool] eq ""} {
+        puts stderr "PTY smoke test requires $tool"
+        exit 1
+    }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok bash] 0]
+set root ""
+set socket ""
+set client ""
+set extra_clients {}
+set stage 0
+
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket {*}$args]
+}
+proc eventually {script message} {
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        if {[uplevel 1 $script]} { return }
+        # Drain redraws so a blocked client cannot stall the test's PTY.
+        global client extra_clients
+        foreach viewer [concat [list $client] $extra_clients] {
+            if {$viewer ne ""} {
+                expect -i $viewer -timeout 0 -re {.+} {} timeout {} eof {error "tmux client exited"}
+            }
+        }
+        after 50
+    }
+    error "timed out: $message"
+}
+proc screen {pane} { return [tm capture-pane -p -t $pane] }
+proc contains {pane text} {
+    return [expr {[string first $text [screen $pane]] >= 0}]
+}
+proc clients {} {
+    return [llength [split [string trim [tm list-clients -F {#{client_pid}}]]]]
+}
+proc type {text} {
+    global client
+    send -i $client -- $text
+}
+proc f7 {} { type "\033\[18~" }
+proc binding {{key F7}} {
+    foreach line [split [tm list-keys] \n] {
+        if {[regexp {^bind-key +(?:-r +)?-T +root +([^ ]+) +} $line ignored actual] && $actual eq $key} { return $line }
+    }
+    return ""
+}
+proc verify_fixtures {pane} {
+    global root
+    type [format {if [[ $(command -v claude) == '%s/bin/claude' && $(command -v nvim) == '%s/bin/nvim' ]]; then printf 'AFT_PATH_%%s\n' SAFE; fi} $root $root]
+    type "\r"
+    eventually [list contains $pane AFT_PATH_SAFE] "only private fixture executables are on the command path"
+}
+proc launch {pane command name} {
+    global stage
+    incr stage
+    type "printf '\\033\[2J\\033\[H'; printf 'AFT_STAGE_%s\\n' $stage; $command\r"
+    eventually [list contains $pane "AFT_STAGE_$stage"] "new fixture stage"
+    eventually [list contains $pane "AFT_READY $name"] "fixture ready: $command"
+}
+proc worker_job {pane} {
+    set text [screen $pane]
+    check {[regexp {AFT_READY claude pid=([0-9]+)} $text ignored parent]} "worker fixture PID missing"
+    set job [list $parent]
+    foreach {ignored child group} [regexp -all -inline {AFT_WORKER pid=([0-9]+) pgid=([0-9]+)} $text] {
+        check {$group eq $parent} "worker left the harness process group"
+        check {[regexp -all -inline {\S+} [exec ps -p $child -o ppid=,pgid=]] eq [list $parent $parent]} "worker is not a same-PGID harness descendant"
+        lappend job $child
+    }
+    check {[llength $job] == 4} "expected three ready pipe-stdin workers"
+    return $job
+}
+proc job_alive {job} {
+    foreach pid $job { exec kill -0 $pid }
+}
+proc job_gone {job} {
+    foreach pid $job {
+        if {![catch {exec kill -0 $pid 2>@1}]} { return 0 }
+    }
+    return 1
+}
+proc float_for {owner} {
+    set found ""
+    foreach line [split [tm list-panes -a -F {#{pane_id}|#{@aft_owner}}] \n] {
+        lassign [split $line |] pane parent
+        if {$parent eq $owner} {
+            check {$found eq ""} "multiple float panes for $owner"
+            set found $pane
+        }
+    }
+    check {$found ne ""} "no float for $owner"
+    return $found
+}
+proc write_private {path contents} {
+    set out [open $path {WRONLY CREAT TRUNC} 0600]
+    puts $out $contents
+    close $out
+}
+proc teardown {} {
+    global root socket client extra_clients tmux
+    if {$socket ne "" && [file exists $socket]} {
+        catch {exec $tmux -S $socket kill-server}
+    }
+    foreach viewer [concat [list $client] $extra_clients] {
+        if {$viewer ne ""} {
+            catch {close -i $viewer}
+            catch {wait -i $viewer}
+        }
+    }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+
+set failed [catch {
+    # Short socket paths also fit macOS's sockaddr_un limit. mktemp creates 0700.
+    set root [file normalize [exec mktemp -d /tmp/aft-pty.XXXXXXXX]]
+    file attributes $root -permissions 0700
+    set inherited_path $env(PATH)
+    # Keep Tcl's env-array trace: unsetting the whole array disables export tracking.
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) $inherited_path
+    set env(HOME) [file join $root home]
+    set env(XDG_CONFIG_HOME) [file join $root config]
+    set env(XDG_DATA_HOME) [file join $root data]
+    set env(XDG_STATE_HOME) [file join $root state]
+    set env(XDG_RUNTIME_DIR) [file join $root runtime]
+    set env(TMUX_TMPDIR) [file join $root sockets]
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set env(PS1) {AFT_PROMPT> }
+    set env(PROMPT_COMMAND) ""
+    foreach directory [list $env(HOME) $env(XDG_CONFIG_HOME) $env(XDG_DATA_HOME) $env(XDG_STATE_HOME) $env(XDG_RUNTIME_DIR) $env(TMUX_TMPDIR) [file join $root bin]] {
+        file mkdir $directory
+        file attributes $directory -permissions 0700
+    }
+    set socket [file join $env(TMUX_TMPDIR) server]
+    set binary [file join $root bin agent-float-term]
+    file copy $source_binary $binary
+    file attributes $binary -permissions 0700
+    set claude [file join $root bin claude]
+    # The inspector sees the real OS argv, including --print. Only the fixture's
+    # argument guard is adapted so it can keep reading keys in headless-mode tests.
+    set adapter [file join $root terminal.c]
+    write_private $adapter "#define main fixture_main\n#include \"$fixture\"\n#undef main\nint main(int argc, char **argv) { (void)argc; return fixture_main(1, argv); }"
+    exec cc -std=c99 -Wall -Wextra -Werror $adapter -o $claude
+    file attributes $claude -permissions 0700
+    file copy $claude [file join $root bin nvim]
+    set env(PATH) "[file join $root bin]:$env(PATH)"
+    set config_dir [file join $env(XDG_CONFIG_HOME) agent-float-term]
+    file mkdir $config_dir
+    file attributes $config_dir -permissions 0700
+    set config [file join $config_dir config.toml]
+    set valid_config "shell = '$shell'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    write_private $config $valid_config
+
+    set help [exec $binary --help]
+    check {[string first dispatch $help] < 0} "dispatch leaked into public help"
+    set bad [catch {exec $binary start claude} output options]
+    check {$bad && [lindex [dict get $options -errorcode] 0] eq "CHILDSTATUS" && [lindex [dict get $options -errorcode] 2] == 1} "invalid CLI input must exit 1"
+} message options]
+# The main scenario follows below; setup errors use the same cleanup path.
+if {!$failed} {
+    set failed [catch {
+        set preview [exec $binary install]
+        check {[string first "Preview only" $preview] >= 0} "install did not preview"
+        check {![file exists [file join $env(XDG_STATE_HOME) agent-float-term]]} "preview wrote state"
+        tm -f /dev/null new-session -d -s outer -c $env(HOME) $shell --noprofile --norc -i
+        tm set-option -g default-shell $shell
+        tm set-option -g status off
+        # A zero timeout can split F7 across the nested PTYs under scheduler load.
+        tm set-option -g escape-time 100
+        set outer [tm display-message -p -t outer: {#{pane_id}}]
+        set outer_pid [tm display-message -p -t $outer {#{pane_pid}}]
+        # Leave this shadow in place through popup reuse, cleanup, and uninstall.
+        tm set-option -p -t $outer @aft_generation STALE_PANE_MARKER
+
+        # Refuse an occupied root key; replacement must be explicit and restorable.
+        tm bind-key -n F7 display-message AFT_ORIGINAL_BINDING
+        set original [binding]
+        check {$original ne ""} "original binding was not captured"
+        # Keep the detached control shell alive while testing an incompatible
+        # global policy. bind must refuse, not silently change the user's policy.
+        tm set-option -t outer destroy-unattached off
+        tm set-option -g destroy-unattached on
+        check {[catch {exec $binary bind --socket $socket --replace-key 2>@1} refusal]} "bind accepted global destroy-unattached on"
+        check {[string first "destroy-unattached is on" $refusal] >= 0} "bind refused for the wrong reason"
+        check {[tm show-options -gv destroy-unattached] eq "on"} "bind changed global destroy-unattached"
+        check {[binding] eq $original} "incompatible bind modified the key"
+        check {[tm list-panes -a -F {#{pane_id}}] eq $outer} "incompatible bind spawned a float"
+        check {[tm display-message -p -t $outer {#{pane_pid}}] eq $outer_pid} "incompatible bind replaced the outer shell"
+        tm set-option -g destroy-unattached off
+        tm set-option -u -t outer destroy-unattached
+        check {[catch {exec $binary bind --socket $socket} refusal]} "bind accepted a key collision"
+        check {[binding] eq $original} "refused bind modified the key"
+        exec $binary bind --socket $socket --replace-key
+        check {[tm show-options -gv destroy-unattached] eq "off"} "successful bind changed global destroy-unattached"
+        set owned [binding]
+        check {$owned ne $original} "bind did not install integration"
+        set generation [tm show-options -gqv @aft_generation]
+        check {$generation ne "" && $generation ne "STALE_PANE_MARKER"} "bind did not use a global generation"
+        check {[string first [format {#{==:#{@aft_float_generation},%s}} $generation] $owned] >= 0} "float hide predicate did not pin the verified generation"
+        exec $binary bind --socket $socket
+        check {[binding] eq $owned} "bind is not idempotent"
+
+        spawn -noecho $tmux -S $socket attach-session -t outer
+        set client $spawn_id
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        eventually {expr {[clients] == 1}} "attach outer client"
+        type "PS1='AFT_PROMPT> '; unset PROMPT_COMMAND; printf 'AFT_OUTER_%s\\n' READY\r"
+        eventually {contains $outer AFT_OUTER_READY} "outer shell ready"
+        verify_fixtures $outer
+        # A shell builtin reads the exact F7 sequence, without an external process.
+        type {printf 'AFT_READ_%s\n' READY; IFS= read -r -s -n 5 key; if [[ $key == $'\e[18~' ]]; then printf 'AFT_SHELL_%s\n' PASS; fi}
+        type "\r"
+        eventually {contains $outer AFT_READ_READY} "shell builtin waiting for F7"
+        f7
+        eventually {contains $outer AFT_SHELL_PASS} "ordinary shell F7 passthrough"
+        check {[clients] == 1} "shell unexpectedly opened a popup"
+
+        launch $outer nvim nvim
+        f7
+        eventually {contains $outer "AFT_KEY nvim count=1"} "unmapped foreground F7 passthrough"
+        check {[clients] == 1} "unmapped fixture opened a popup"
+        type q
+        after 200
+        launch $outer {claude --print} claude
+        f7
+        eventually {contains $outer "AFT_KEY claude count=1"} "headless mapped invocation passes F7"
+        check {[clients] == 1} "headless invocation opened a popup"
+        type q
+        after 200
+
+        launch $outer claude claude
+        check {[regexp {AFT_READY claude pid=([0-9]+)} [screen $outer] ignored stopped_pid]} "mapped fixture PID missing"
+        exec kill -STOP $stopped_pid
+        eventually {contains $outer Stopped} "mapped fixture suspended"
+        launch $outer nvim nvim
+        f7
+        eventually {contains $outer "AFT_KEY nvim count=1"} "suspended mapped job does not claim foreground editor"
+        check {[clients] == 1} "suspended job opened a popup"
+        exec kill -0 $stopped_pid
+        type q
+        after 200
+        type "kill -TERM $stopped_pid; kill -CONT $stopped_pid; wait $stopped_pid 2>/dev/null; printf 'AFT_REAP_%s\\n' DONE\r"
+        eventually {contains $outer AFT_REAP_DONE} "suspended fixture reaped"
+        # Environment assignment leaves the mapped fixture's OS argv at argc=1.
+        launch $outer {AFT_TEST_WORKERS=3 claude} claude
+        set worker_job [worker_job $outer]
+        set outer_before [screen $outer]
+        f7
+        eventually {expr {[clients] == 2}} "F7 opens popup with second client"
+        set float ""
+        foreach pane [split [tm list-panes -a -F {#{pane_id}}] \n] {
+            if {$pane ne $outer} { check {$float eq ""} "more than one float"; set float $pane }
+        }
+        check {$float ne ""} "popup has no persistent pane"
+        set float_pid [tm display-message -p -t $float {#{pane_pid}}]
+        set float_session [tm display-message -p -t $float {#{session_name}}]
+        check {[tm display-message -p -t $float {#{@aft_owner}|#{@aft_float_generation}}] eq "$outer|$generation"} "float ownership used the pane-local generation"
+        verify_fixtures $float
+        type "cd '$root'; AFT_VALUE=kept; printf 'AFT_FLOAT_%s\\n' READY\r"
+        eventually {contains $float AFT_FLOAT_READY} "floating shell accepts input"
+        f7
+        eventually {expr {[clients] == 1}} "F7 hides popup"
+        check {[tm display-message -p -t $float {#{pane_pid}}] eq $float_pid} "hide killed floating shell"
+        check {[screen $outer] eq $outer_before} "popup input leaked to outer fixture"
+        job_alive $worker_job
+        # Session names are presentation, not the ownership/lookup identity.
+        tm rename-session -t $float_session {renamed|float}
+        set float_session {renamed|float}
+        f7
+        eventually {expr {[clients] == 2}} "F7 reopens renamed popup"
+        check {[float_for $outer] eq $float} "rename created a duplicate float"
+        check {[tm display-message -p -t $float {#{pane_pid}}] eq $float_pid} "rename/reopen replaced floating shell"
+        check {[tm display-message -p -t $float {#{session_name}}] eq $float_session} "reopen discarded the user's session name"
+        set renamed_listing [exec $binary sessions --socket $socket 2>@1]
+        check {[string first "$float_session\towner=$outer\tviewers=1\tretained" $renamed_listing] >= 0} "renamed float containing a pipe was not listed: $renamed_listing"
+        type {printf 'AFT_STATE_%s:%s\n' "$AFT_VALUE" "$PWD"}
+        type "\r"
+        eventually {contains $float "AFT_STATE_kept:$root"} "float variable and cwd persist"
+        job_alive $worker_job
+        type "nvim\r"
+        eventually {contains $float "AFT_READY nvim"} "editor in floating shell"
+        check {[regexp {AFT_READY nvim pid=([0-9]+)} [screen $float] ignored editor_pid]} "editor PID missing"
+        f7
+        eventually {expr {[clients] == 1}} "F7 hides even inside float editor"
+        exec kill -0 $editor_pid
+        check {![contains $float "AFT_KEY nvim"]} "float editor received reserved F7"
+        f7
+        eventually {expr {[clients] == 2}} "reopen float editor"
+        type q
+        after 200
+        f7
+        eventually {expr {[clients] == 1}} "hide after editor exit"
+
+        # Exiting must close the inner client even if the user's global setting
+        # would otherwise switch it into the live AI session.
+        tm set-option -g detach-on-destroy off
+        f7
+        eventually {expr {[clients] == 2}} "open float before exit"
+        type "exit\r"
+        eventually {expr {[clients] == 1}} "float exit closes popup instead of switching into AI"
+        check {[catch {tm has-session -t $float_session}]} "exited float session survived"
+        check {[screen $outer] eq $outer_before} "float exit sent input to AI"
+        f7
+        eventually {expr {[clients] == 2}} "recreate exited float"
+        set previous_float_pid $float_pid
+        set float [float_for $outer]
+        set float_pid [tm display-message -p -t $float {#{pane_pid}}]
+        set float_session [tm display-message -p -t $float {#{session_name}}]
+        check {$float_pid ne $previous_float_pid} "recreated float reused the old shell PID"
+        verify_fixtures $float
+        type {printf 'AFT_FRESH_%s\n' "${AFT_VALUE-unset}"; AFT_VALUE=first}
+        type "\r"
+        eventually {contains $float AFT_FRESH_unset} "new float has fresh shell state"
+
+        set viewer_before [tm list-clients -t $float_session -F {#{client_pid}}]
+        spawn -noecho $tmux -S $socket attach-session -t outer
+        set second_client $spawn_id
+        lappend extra_clients $second_client
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        eventually {expr {[clients] == 3}} "second outer client attached"
+        send -i $second_client -- "\033\[18~"
+        expect {
+            -i $second_client -timeout 15
+            -re {already open or opening in another client} {}
+            timeout {error "second client did not receive contention refusal"}
+            eof {error "second client exited during contention"}
+        }
+        check {[clients] == 3} "contention created another viewer"
+        check {[tm list-clients -t $float_session -F {#{client_pid}}] eq $viewer_before} "second client took over the float"
+        type "printf 'AFT_VIEWER_%s\\n' ORIGINAL\r"
+        eventually {contains $float AFT_VIEWER_ORIGINAL} "original viewer retains keyboard ownership"
+        send -i $second_client -- "\002d"
+        expect -i $second_client -timeout 15 eof {} timeout {error "second client did not detach"}
+        wait -i $second_client
+        set extra_clients {}
+        f7
+        eventually {expr {[clients] == 1}} "hide after contention"
+
+        # A nested interactive shell is still a valid ancestry chain, not a wrapper.
+        type q
+        eventually {contains $outer "AFT_WORKERS_REAPED count=3"} "normal harness exit reaps all workers"
+        eventually {job_gone $worker_job} "original harness and workers exited"
+        # A killed parent cannot leave helpers blocked forever on inherited writers.
+        launch $outer {AFT_TEST_WORKERS=3 claude} claude
+        set killed_job [worker_job $outer]
+        exec kill -KILL [lindex $killed_job 0]
+        eventually {job_gone $killed_job} "workers exit on EOF when their parent dies"
+        type "$shell --noprofile --norc -i\r"
+        type "printf 'AFT_NESTED_%s\\n' READY\r"
+        eventually {contains $outer AFT_NESTED_READY} "nested shell ready"
+        verify_fixtures $outer
+        launch $outer claude claude
+        f7
+        eventually {expr {[clients] == 2}} "nested shell foreground harness opens float"
+        check {[float_for $outer] eq $float} "nested shell created a second float for the pane"
+        f7
+        eventually {expr {[clients] == 1}} "hide nested-shell float"
+        type q
+        after 200
+        type "exit\r"
+        after 200
+        launch $outer claude claude
+
+        set second_pane [tm new-window -d -P -F {#{pane_id}} -t outer -n second -c $env(HOME) $shell --noprofile --norc -i]
+        tm select-window -t outer:second
+        verify_fixtures $second_pane
+        launch $second_pane claude claude
+        check {[tm display-message -p -t $second_pane {#{pane_current_path}}] eq [tm display-message -p -t $outer {#{pane_current_path}}]} "parent panes do not share cwd"
+        f7
+        eventually {expr {[clients] == 2}} "second parent opens independent float"
+        set second_float [float_for $second_pane]
+        set second_float_pid [tm display-message -p -t $second_float {#{pane_pid}}]
+        set second_session [tm display-message -p -t $second_float {#{session_name}}]
+        check {$second_float ne $float && $second_float_pid ne $float_pid} "same-cwd panes shared a floating shell"
+        type {printf 'AFT_SECOND_%s\n' "${AFT_VALUE-unset}"; AFT_VALUE=second}
+        type "\r"
+        eventually {contains $second_float AFT_SECOND_unset} "second float state is independent"
+        f7
+        eventually {expr {[clients] == 1}} "hide second float"
+        tm select-window -t [tm display-message -p -t $outer {#{window_id}}]
+        f7
+        eventually {expr {[clients] == 2}} "reopen first pane float"
+        type {printf 'AFT_FIRST_%s\n' "$AFT_VALUE"}
+        type "\r"
+        eventually {contains $float AFT_FIRST_first} "second pane did not overwrite first float state"
+        f7
+        eventually {expr {[clients] == 1}} "hide first float"
+
+        set foreign [tm new-session -d -P -F {#{session_id}} -s foreign -c $env(HOME) $shell --noprofile --norc -i]
+        set foreign_pid [tm display-message -p -t $foreign {#{pane_pid}}]
+        tm rename-session -t $second_session {orphan|float}
+        set second_session {orphan|float}
+        tm kill-pane -t $second_pane
+        set listing [exec $binary sessions --socket $socket 2>@1]
+        check {[string first "$second_session\towner=$second_pane\tviewers=0\torphan" $listing] >= 0} "orphan not listed"
+        check {[string first "$float_session\towner=$outer\tviewers=0\tretained" $listing] >= 0} "live float not listed"
+        check {[string first foreign $listing] < 0} "foreign session claimed as owned"
+        check {[catch {exec $binary cleanup --socket $socket --session $float_session --yes 2>@1}]} "cleanup accepted a live parent's float"
+        check {[catch {exec $binary cleanup --socket $socket --session foreign --yes 2>@1}]} "cleanup accepted a foreign session"
+        set preview [exec $binary cleanup --socket $socket --session $second_session 2>@1]
+        check {[string first "Would remove $second_session" $preview] >= 0} "orphan cleanup did not preview"
+        check {[tm display-message -p -t $second_float {#{pane_pid}}] eq $second_float_pid} "preview killed the orphan"
+        exec $binary cleanup --socket $socket --yes 2>@1
+        check {[catch {tm has-session -t $second_session}]} "cleanup retained the selected orphan"
+        check {[tm display-message -p -t $foreign {#{pane_pid}}] eq $foreign_pid} "cleanup killed foreign shell"
+        check {[tm display-message -p -t $float {#{pane_pid}}] eq $float_pid} "cleanup killed live float"
+        check {[tm show-options -gqv @aft_generation] eq $generation} "popup lifecycle changed the global generation"
+        check {[tm show-options -pqv -t $outer @aft_generation] eq "STALE_PANE_MARKER"} "popup lifecycle removed the pane-local shadow"
+        set doctor [exec $binary doctor --socket $socket]
+        check {[string first "Owned key binding: intact" $doctor] >= 0} "pane-local generation broke doctor ownership: $doctor"
+
+        write_private $config {width = 'invalid'}
+        f7
+        eventually {contains $outer "AFT_KEY claude count=1"} "invalid config forwards F7"
+        check {[clients] == 1} "invalid config opened a popup"
+        write_private $config $valid_config
+        # Move only our private copy, leaving the build artifact untouched.
+        file rename $binary ${binary}.away
+        f7
+        eventually {contains $outer "AFT_KEY claude count=2"} "missing executable fallback forwards F7"
+        file rename ${binary}.away $binary
+
+        exec $binary install --yes 2>@1
+        exec $binary uninstall --yes 2>@1
+        check {[binding] eq $original} "uninstall failed to restore owned replacement"
+        check {[tm display-message -p -t $outer {#{pane_pid}}] eq $outer_pid} "outer shell was replaced"
+        check {[tm display-message -p -t $float {#{pane_pid}}] eq $float_pid} "uninstall killed persistent shell"
+        tm has-session -t $float_session
+
+        exec $binary install --yes 2>@1
+        exec $binary bind --socket $socket --replace-key 2>@1
+        tm bind-key -n F7 display-message AFT_USER_CHANGED
+        set user_binding [binding]
+        exec $binary uninstall --yes 2>@1
+        check {[binding] eq $user_binding} "uninstall overwrote a user-changed F7 binding"
+
+        # Older tmux canonicalizes C-i to Tab; 3.7c keeps distinct bindings.
+        # Capture tmux's spelling, and test collision consent on either version.
+        tm bind-key -n C-i display-message AFT_ORIGINAL_ALIAS
+        set alias_key ""
+        foreach line [split [tm list-keys] \n] {
+            if {[regexp {^bind-key +(?:-r +)?-T +root +([^ ]+) +display-message AFT_ORIGINAL_ALIAS$} $line ignored alias_key]} { break }
+        }
+        check {$alias_key in {C-i Tab}} "C-i binding was not serialized as C-i or Tab"
+        set original_alias [binding $alias_key]
+        set original_tab [binding Tab]
+        write_private $config "key = 'C-i'\n$valid_config"
+        check {[catch {exec $binary bind --socket $socket 2>@1}]} "C-i bypassed the $alias_key key collision"
+        check {[binding $alias_key] eq $original_alias} "alias refusal modified $alias_key"
+        exec $binary install --yes 2>@1
+        exec $binary bind --socket $socket --replace-key 2>@1
+        check {[binding $alias_key] ne $original_alias && [binding $alias_key] ne ""} "alias replacement did not bind $alias_key"
+        exec $binary uninstall --yes 2>@1
+        check {[binding $alias_key] eq $original_alias} "uninstall failed to restore $alias_key"
+        check {[binding Tab] eq $original_tab} "alias cleanup modified Tab"
+        check {[binding] eq $user_binding} "alias cleanup modified unrelated user F7"
+    } message options]
+}
+if {$failed} {
+    puts stderr "PTY smoke FAILED: $message"
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+    if {$socket ne "" && [file exists $socket]} {
+        catch {puts stderr "clients: [tm list-clients]"}
+        catch {
+            foreach binding [split [tm list-keys] \n] {
+                if {[string first " F7 " $binding] >= 0} { puts stderr "binding: $binding" }
+            }
+        }
+        catch {puts stderr "pane format: [tm display-message -p -t %0 {#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_id}|#{pane_dead}|#{pane_in_mode}}]"}
+        catch {
+            foreach session [split [tm list-sessions -F {#{session_id}}] \n] {
+                puts stderr "session $session: [tm show-options -t $session]"
+            }
+        }
+        catch {
+            foreach pane [split [tm list-panes -a -F {#{pane_id}}] \n] {
+                puts stderr "pane $pane:\n[screen $pane]"
+            }
+        }
+    }
+}
+teardown
+if {$failed} { exit 1 }
+puts "PTY smoke passed: scope, worker-backed popup/PID persistence/EOF cleanup, persistence/rename/exit, pane isolation, contention, orphans, fallback, binding ownership/aliases, pane-local generation shadow, incompatible policy refusal"

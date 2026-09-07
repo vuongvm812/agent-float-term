@@ -1,0 +1,213 @@
+#!/usr/bin/env expect
+# expect tests/theme_smoke.exp /path/to/agent-float-term
+# Select a real tmux (>= 3.3a) with PATH. PTY color semantics, NOT OS opacity.
+set timeout 15
+log_user 0
+if {$argc != 1} { puts stderr "usage: expect tests/theme_smoke.exp /path/to/agent-float-term"; exit 1 }
+set source_binary [file normalize [lindex $argv 0]]
+set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
+foreach tool {tmux cc bash} {
+    if {[auto_execok $tool] eq ""} { puts stderr "theme smoke requires $tool"; exit 1 }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok bash] 0]
+set version [exec $tmux -V]
+set root ""
+set socket ""
+set client ""
+set stream ""
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} { global tmux socket; return [exec $tmux -S $socket {*}$args] }
+proc type {text} { global client; send -i $client -- $text }
+proc f7 {} { type "\033\[18~" }
+proc drain {} {
+    global client stream
+    expect -i $client -timeout 0 -re {.+} { append stream $expect_out(0,string) } timeout {} eof { error "tmux client exited" }
+}
+proc eventually {script message} {
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        drain
+        if {[uplevel 1 $script]} { return }
+        after 50
+    }
+    error "timed out: $message"
+}
+proc attached {count} { return [expr {[llength [split [tm list-clients -F {#{client_pid}}]]] == $count}] }
+proc contains {pane text} { return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}] }
+proc styles {scope target} {
+    set result {}
+    foreach option {window-style window-active-style} { lappend result [tm show-options $scope -t $target $option] }
+    return $result
+}
+proc globals {} {
+    set result {}
+    foreach option {popup-style popup-border-style window-style window-active-style} {
+        lappend result [tm show-options -g $option]
+    }
+    return $result
+}
+# Only decode SGR and printable output, not a framebuffer. Ignore OSC, charset,
+# and cursor controls; retain a color pair for EVERY character in each marker.
+proc colors {marker foreground background} {
+    global stream
+    set fg default; set bg default; set text ""; set pairs {}; set seen 0
+    foreach token [regexp -all -inline {\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b.|[^\x1b]} $stream] {
+        if {[regexp {^\x1b\[([0-9;:]*)m$} $token ignored parameters]} {
+            set codes [split [string map {: ;} $parameters] {;}]
+            for {set i 0} {$i < [llength $codes]} {incr i} {
+                set code [lindex $codes $i]
+                if {$code eq "" || $code == 0} { set fg default; set bg default
+                } elseif {$code == 39} { set fg default
+                } elseif {$code == 49} { set bg default
+                } elseif {$code == 38 || $code == 48} {
+                    set channel [expr {$code == 38 ? "fg" : "bg"}]
+                    set mode [lindex $codes [incr i]]
+                    if {$mode == 2} {
+                        if {[lindex $codes [expr {$i + 1}]] eq ""} { incr i }
+                        set rgb [lrange $codes [expr {$i + 1}] [expr {$i + 3}]]
+                        set $channel "rgb:[join $rgb ,]"; incr i 3
+                    } elseif {$mode == 5} { set $channel "index:[lindex $codes [incr i]]"
+                    } else { error "unsupported SGR color: $token" }
+                } elseif {($code >= 30 && $code <= 37) || ($code >= 90 && $code <= 97)} { set fg "ansi:$code"
+                } elseif {($code >= 40 && $code <= 47) || ($code >= 100 && $code <= 107)} { set bg "ansi:$code" }
+            }
+        } elseif {[string index $token 0] ne "\033"} {
+            append text $token
+            lappend pairs [list $fg $bg]
+            set text [string range $text end-[expr {[string length $marker] - 1}] end]
+            set pairs [lrange $pairs end-[expr {[string length $marker] - 1}] end]
+            if {$text eq $marker} {
+                foreach pair $pairs { check {$pair eq [list $foreground $background]} "$marker: expected $foreground/$background, got $pair" }
+                incr seen
+            }
+        }
+    }
+    return [expr {$seen > 0}]
+}
+proc teardown {} {
+    global root socket client tmux
+    if {$socket ne "" && [file exists $socket]} { catch {exec $tmux -S $socket kill-server} }
+    if {$client ne ""} { catch {close -i $client}; catch {wait -i $client} }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+set failed [catch {
+    set root [file normalize [exec mktemp -d /tmp/aft-theme.XXXXXXXX]]
+    set inherited_path $env(PATH)
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) "$root/bin:$inherited_path"
+    foreach {name directory} {HOME home XDG_CONFIG_HOME config XDG_DATA_HOME data XDG_STATE_HOME state XDG_RUNTIME_DIR runtime TMUX_TMPDIR sockets} {
+        set env($name) [file join $root $directory]
+        file mkdir $env($name)
+        file attributes $env($name) -permissions 0700
+    }
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set env(PS1) {AFT_PROMPT> }
+    file mkdir $root/bin $env(XDG_CONFIG_HOME)/agent-float-term
+    set binary $root/bin/agent-float-term
+    file copy $source_binary $binary
+    file attributes $binary -permissions 0700
+    set claude $root/bin/claude
+    exec cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
+    set out [open $env(XDG_CONFIG_HOME)/agent-float-term/config.toml {WRONLY CREAT EXCL} 0600]
+    puts $out "shell = '$shell'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    close $out
+    set socket $env(TMUX_TMPDIR)/server
+    tm -f /dev/null new-session -d -s outer -c $env(HOME) $shell --noprofile --norc -i
+    tm set-option -g default-shell $shell
+    tm set-option -g status off
+    tm set-option -g escape-time 100
+    tm set-option -g popup-border-lines simple
+    tm set-option -g popup-style fg=#aabbcc,bg=#112233
+    tm set-option -g popup-border-style fg=#aa3366,bg=#334455
+    set sentinel bold,underscore,fg=#aabbcc,bg=#445566
+    foreach option {window-style window-active-style} { tm set-option -g $option $sentinel }
+    set outer [tm display-message -p -t outer: {#{pane_id}}]
+    set parent [tm display-message -p -t $outer {#{pane_id}|#{pane_pid}|#{window_id}}]
+    foreach option {window-style window-active-style} {
+        tm set-option -w -t $outer $option $sentinel
+        # Visible control stays terminal-default without changing window/global sentinels.
+        tm set-option -p -t $outer $option none,fg=terminal,bg=terminal
+    }
+    set before [globals]
+    set outer_window [styles -w $outer]; set outer_pane [styles -p $outer]
+    exec $binary bind --socket $socket
+    spawn -noecho $tmux -T RGB -S $socket attach-session -t outer
+    set client $spawn_id
+    match_max -i $client 1048576
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached 1} "outer client"
+    type "printf '\\033\[0mAFT_OUTER_%s\\n' DEFAULT; claude\r"
+    eventually {contains $outer "AFT_READY claude"} "no-argument compiled claude fixture"
+    eventually {colors AFT_OUTER_DEFAULT default default} "outer visible control"
+    # A raw popup without -s/-S must expose the inherited RGB sentinels.
+    set stream ""
+    set raw_pid [exec $tmux -S $socket display-popup -E -t $outer -w 80% -h 80% "printf '\\033\[0mAFT_RAW_%s\\n' DEFAULT; exec '$claude'" &]
+    eventually {colors AFT_RAW_DEFAULT rgb:170,187,204 rgb:17,34,51} "raw popup negative control"
+    check {[colors ------ rgb:170,51,102 rgb:51,68,85]} "raw border sentinel not observed"
+    type q
+    eventually {expr {[catch {exec kill -0 $raw_pid 2>@1}]}} "raw popup closed"
+    drain
+    set stream ""
+    foreach opening {first reopen} {
+        f7
+        eventually {attached 2} "$opening popup"
+        set float ""
+        foreach line [split [tm list-panes -a -F {#{pane_id}|#{@aft_owner}}] \n] {
+            lassign [split $line |] pane owner
+            if {$owner eq $outer} { check {$float eq ""} "duplicate owned panes"; set float $pane }
+        }
+        check {$float ne ""} "no owned float"
+        check {[llength [split [tm list-panes -a -F {#{pane_id}}]]] == 2} "extra nested pane"
+        foreach scope {-w -p} {
+            foreach option {window-style window-active-style} {
+                set actual [tm show-options ${scope}v -t $float $option]
+                check {$actual eq "fg=terminal,bg=terminal" || $actual eq "none,fg=terminal,bg=terminal"} "$opening $scope $option: $actual"
+            }
+        }
+        type "printf '\\033\[0mAFT_${opening}_%s\\n\\033\[38;2;12;34;56;48;2;65;43;21mAFT_${opening}_%s\\033\[0m\\n' DEFAULT RGB\r"
+        eventually [list colors AFT_${opening}_DEFAULT default default] "$opening default content"
+        eventually [list colors AFT_${opening}_RGB rgb:12,34,56 rgb:65,43,21] "$opening explicit RGB content"
+        check {[colors ------ default default]} "$opening terminal-default border not observed"
+        check {[globals] eq $before} "$opening changed global styles"
+        check {[styles -w $outer] eq $outer_window && [styles -p $outer] eq $outer_pane} "$opening changed outer overrides"
+        check {[tm display-message -p -t $outer {#{pane_id}|#{pane_pid}|#{window_id}}] eq $parent} "parent identity changed"
+        set identity [tm display-message -p -t $float {#{pane_id}|#{pane_pid}}]
+        if {$opening eq "reopen"} { check {$identity eq $retained} "reopen replaced the owned shell" }
+        set retained $identity
+        f7
+        eventually {attached 1} "hide $opening"
+        # Reopening must clear attributes and colors at BOTH owned scopes, not just creation.
+        foreach scope {-w -p} {
+            foreach option {window-style window-active-style} { tm set-option $scope -t $float $option $sentinel }
+        }
+        drain
+        set stream ""
+    }
+    # A foreign link makes window-level writes unsafe: refuse before any style mutation.
+    tm new-session -d -s foreign $shell --noprofile --norc -i
+    set window [tm display-message -p -t $float {#{window_id}}]
+    tm link-window -s $window -t foreign:
+    set linked_window [styles -w $float]; set linked_pane [styles -p $float]
+    tm set-option -g @aft_last_error ""
+    f7
+    eventually {expr {[tm show-options -gqv @aft_last_error] ne ""}} "linked-window refusal"
+    check {[regexp -nocase {link|shar|foreign} [tm show-options -gqv @aft_last_error]]} "popup refused for a reason other than the foreign link"
+    check {[attached 1]} "linked float opened instead of refusing"
+    check {[styles -w $float] eq $linked_window && [styles -p $float] eq $linked_pane} "refusal changed foreign-linked styles"
+    check {$window in [split [tm list-windows -t foreign -F {#{window_id}}]]} "refusal removed the foreign link"
+    check {[globals] eq $before} "global styles changed after refusal"
+    check {[styles -w $outer] eq $outer_window && [styles -p $outer] eq $outer_pane} "outer overrides changed after refusal"
+    check {[tm display-message -p -t $outer {#{pane_id}|#{pane_pid}|#{window_id}}] eq $parent} "refusal changed parent identity"
+} message options]
+if {$failed} {
+    puts stderr "Theme smoke FAILED ($version, $tmux): $message"
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+}
+teardown
+if {$failed} { exit 1 }
+puts "Theme smoke passed ($version, $tmux): raw RGB negative control, default content/border, explicit RGB, per-open owned styles, exact global/outer preservation, stable parent, linked-window refusal; PTY colors only"

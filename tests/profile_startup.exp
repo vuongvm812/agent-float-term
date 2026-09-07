@@ -1,0 +1,820 @@
+#!/usr/bin/env expect
+# Opt-in research: real configured, no-argument TUI startup. No input except VT replies.
+# Require AFT_PROFILE_CONSENT=1 and AFT_DISABLE=1 outside; inherit the login environment.
+# Suppress shell initialization output, forwarding only the profiler through descriptor 3:
+# AFT_PROFILE_CONSENT=1 AFT_DISABLE=1 /bin/zsh -lic 'exec /usr/bin/expect -N -n /ABS/tests/profile_startup.exp variants 5 >&3 2>&3' 3>&1 >/dev/null 2>&1
+# expect -N -n tests/profile_startup.exp direct|tmux|all|claude|opencode|diagnose|sample|variants|theme ?serial_trials=3?
+# AFT_PROFILE_PROJECT optionally selects an existing cwd; only the separate mktemp root
+# belongs to this profiler. The selected app may perform its normal startup metadata writes.
+# claude/opencode focus on one app, direct plus explicitly selected tmux binaries only.
+# AFT_PROFILE_GUARDS selects direct cases (disabled, unset, or both as a Tcl list).
+# theme keeps configured OpenCode unchanged and varies only OSC 10/11 reply delivery.
+# Executables are discovered on PATH before isolation. Optional AFT_PROFILE_TMUX_OLD
+# selects a private older tmux; AFT_PROFILE_TMUX_CURRENT overrides the PATH tmux.
+# variants: OpenCode 1.18.29, first launch per variant recorded but excluded from summaries.
+# Its isolated_default case has private HOME/config/data/state/cache/auth, reused between trials.
+# diagnose adds CPU/helper/TCP-state observations; sample also classifies native stacks.
+# These instrumented runs are separate from baseline timings. selftest launches no apps.
+# Terminal content is bounded, transient, and never printed or saved. No user files read.
+log_user 0
+log_file
+exp_internal 0
+set timeout 20
+set root ""
+set existing_project ""
+set project_kind temporary
+set claude_editor_seen 0
+set claude_home_evidence {}
+set socket ""
+set tmux ""
+set handles {}
+set samplers {}
+set owned [dict create]
+set results [dict create]
+set color_policy osc_immediate
+set color_queue {}
+set color_pairs [dict create OSC10 {} OSC11 {}]
+set color_requests [dict create]
+set color_delays [dict create]
+set color_packets 0
+set original_cwd [pwd]
+proc executable {name} {
+    set path [exec /bin/sh -c {command -v "$1"} aft-profile $name]
+    if {[file pathtype $path] ne "absolute" || ![file executable $path]} { error "executable_unavailable" }
+    return [file normalize $path]
+}
+proc now {} { return [clock clicks -microseconds] }
+proc ms {t} { global began; return [format %.1f [expr {($t-$began)/1000.0}]] }
+proc processes {} {
+    set table [dict create]
+    # No argv, environment, command names, network endpoints, or user paths.
+    foreach line [split [exec /bin/ps -axo pid=,ppid=,lstart=] \n] {
+        if {[regexp {^\s*(\d+)\s+(\d+)\s+(.+)$} $line -> pid parent started]} {
+            dict set table $pid [list $parent $started]
+        }
+    }
+    return $table
+}
+proc own {pid} {
+    global owned
+    set table [processes]
+    if {![dict exists $table $pid]} { error "root_process_unavailable" }
+    dict set owned $pid [lindex [dict get $table $pid] 1]
+}
+proc remember {} {
+    global owned peak
+    set table [processes]
+    set more 1
+    while {$more} {
+        set more 0
+        dict for {pid identity} $table {
+            lassign $identity parent started
+            if {![dict exists $owned $pid] && [dict exists $owned $parent] &&
+                [dict exists $table $parent] &&
+                [lindex [dict get $table $parent] 1] eq [dict get $owned $parent]} {
+                dict set owned $pid $started
+                set more 1
+            }
+        }
+    }
+    set live 0
+    dict for {pid started} $owned {
+        if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} { incr live }
+    }
+    set peak [expr {max($peak,$live)}]
+}
+proc tm {args} { global tmux socket; return [exec $tmux -S $socket {*}$args] }
+proc diagnostic {app_pid phase} {
+    global owned began samplers
+    set start [now]
+    set table [processes]
+    set live {}
+    dict for {pid started} $owned {
+        if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} { lappend live $pid }
+    }
+    foreach channel $samplers {
+        foreach pid [pid $channel] {
+            set index [lsearch -exact $live $pid]
+            if {$index >= 0} { set live [lreplace $live $index $index] }
+        }
+    }
+    if {![llength $live]} { return }
+    set cpu 0
+    set child_cpu 0
+    set classes [dict create]
+    set listing [exec /bin/ps -p [join $live ,] -o pid=,time=,comm=]
+    foreach line [split $listing \n] {
+        if {![regexp {^\s*(\d+)\s+(\d+):(\d+\.\d+)\s+(.+)$} $line -> pid minutes seconds command]} { continue }
+        set millis [expr {1000*($minutes*60+$seconds)}]
+        if {$pid eq $app_pid} { set cpu $millis } else { set child_cpu [expr {$child_cpu+$millis}] }
+        set name [file tail $command]
+        switch -glob -- $name {
+            node - bun - python* - uv - uvx { set category runtime_helper }
+            npm - npx { set category package_manager }
+            git { set category version_control }
+            security { set category credential_helper }
+            curl { set category network_helper }
+            sh - bash - zsh { set category shell }
+            tmux { set category multiplexer }
+            default { set category other }
+        }
+        if {$pid ne $app_pid} { dict incr classes $category }
+    }
+    set states [dict create]
+    # Select protocol states only. lsof never emits endpoints, argv, or file paths.
+    catch {exec /usr/sbin/lsof -nP -a -p [join $live ,] -iTCP -F pT 2>/dev/null} network
+    foreach line [split $network \n] {
+        if {[regexp {^TST=(ESTABLISHED|SYN_SENT|SYN_RCVD|LISTEN|CLOSE_WAIT|FIN_WAIT_1|FIN_WAIT_2|TIME_WAIT|CLOSED)$} $line -> state]} {
+            dict incr states $state
+        }
+    }
+    return "phase=$phase at_ms=[ms $start] app_cpu_ms=[format %.0f $cpu] child_cpu_ms=[format %.0f $child_cpu] helpers=[join $classes ,] tcp=[join $states ,] observer_ms=[format %.1f [expr {([now]-$start)/1000.0}]]"
+}
+proc cleanup {} {
+    global owned handles socket tmux peak samplers
+    # Freeze parents before the final rescan; signals always require matching identity.
+    for {set pass 0} {$pass < 2} {incr pass} {
+        remember
+        set table [processes]
+        dict for {pid started} $owned {
+            if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} {
+                catch {exec /bin/kill -STOP $pid}
+            }
+        }
+    }
+    foreach signal {TERM CONT KILL} {
+        set table [processes]
+        dict for {pid started} $owned {
+            if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} {
+                catch {exec /bin/kill -$signal $pid}
+            }
+        }
+        after 100
+    }
+    foreach handle $handles { catch {close -i $handle}; catch {wait -i $handle} }
+    foreach channel $samplers { catch {close $channel} }
+    set samplers {}
+    set handles {}
+    set table [processes]
+    dict for {pid started} $owned {
+        if {[dict exists $table $pid] && [lindex [dict get $table $pid] 1] eq $started} {
+            error "owned_process_survived_cleanup"
+        }
+    }
+    set owned [dict create]
+    set socket ""
+}
+proc teardown {} {
+    global root original_cwd existing_project
+    cleanup
+    cd $original_cwd
+    if {$root ne ""} {
+        if {$existing_project ne "" && ($root eq $existing_project ||
+            [string first "$root/" "$existing_project/"] == 0)} { error "cleanup_root_overlaps_existing_project" }
+        file delete -force -- $root
+    }
+    set root ""
+}
+trap {catch {teardown}; puts stderr "PROFILE interrupted_cleanup_attempted"; exit 1} {SIGINT SIGTERM SIGHUP}
+
+# This is a deliberately generic xterm-like emulator, not Ghostty emulation.
+# Parse incrementally so split escape sequences receive exactly one response.
+proc flush_colors {} {
+    global color_queue color_delays color_packets client test_replies query_times
+    set remaining {}
+    foreach item $color_queue {
+        lassign $item due reply requests
+        if {[now] < $due} { lappend remaining $item; continue }
+        if {$client eq ""} { append test_replies $reply } else { send -i $client -- $reply }
+        incr color_packets
+        set sent [now]
+        foreach {category requested} $requests {
+            dict lappend query_times $category [ms $sent]
+            dict lappend color_delays $category [format %.1f [expr {($sent-$requested)/1000.0}]]
+        }
+    }
+    set color_queue $remaining
+}
+proc color_reply {category reply} {
+    global color_policy color_queue color_pairs color_requests
+    set requested [now]
+    dict lappend color_requests $category [ms $requested]
+    switch -- $color_policy {
+        osc_immediate {
+            lappend color_queue [list $requested $reply [list $category $requested]]
+            flush_colors
+        }
+        osc_delay200 { lappend color_queue [list [expr {$requested+200000}] $reply [list $category $requested]] }
+        osc_omit {}
+        osc_pair250 {
+            dict lappend color_pairs $category [list $requested $reply]
+            while {[llength [dict get $color_pairs OSC10]] && [llength [dict get $color_pairs OSC11]]} {
+                lassign [lindex [dict get $color_pairs OSC10] 0] fg_time fg
+                lassign [lindex [dict get $color_pairs OSC11] 0] bg_time bg
+                dict set color_pairs OSC10 [lrange [dict get $color_pairs OSC10] 1 end]
+                dict set color_pairs OSC11 [lrange [dict get $color_pairs OSC11] 1 end]
+                lappend color_queue [list [expr {max($fg_time,$bg_time)+250000}] "$fg$bg" [list OSC10 $fg_time OSC11 $bg_time]]
+            }
+        }
+        default { error "unknown_color_policy" }
+    }
+    if {[llength $color_queue]+[llength [dict get $color_pairs OSC10]]+[llength [dict get $color_pairs OSC11]] > 64} {
+        error "color_reply_queue_exceeded_bound"
+    }
+}
+proc terminal {chunk} {
+    global pending plain client query_times first_text row col unhandled test_replies stages sync_active
+    global claude_editor_seen
+    append pending $chunk
+    while {[string length $pending]} {
+        set n [string first "\033" $pending]
+        if {$n < 0} { set n [string length $pending] }
+        if {$n > 0} {
+            set text [string range $pending 0 [expr {$n-1}]]
+            append plain $text
+            if {$first_text eq "" && [regexp {[[:alnum:]]} $text]} { set first_text [now] }
+            foreach c [split $text ""] {
+                # Claude's input chevron must occur at the left edge, not inside debug text.
+                if {$c eq "\u276f" && $col <= 4} { set claude_editor_seen 1 }
+                switch -- $c {
+                    "\r" { set col 1 }
+                    "\n" { set row [expr {min(40,$row+1)}] }
+                    "\b" { set col [expr {max(1,$col-1)}] }
+                    default { if {[string is print $c]} { set col [expr {min(120,$col+1)}] } }
+                }
+            }
+            set pending [string range $pending $n end]
+            continue
+        }
+        if {[string length $pending] < 2} { break }
+        set kind [string index $pending 1]
+        set seq ""
+        set reply ""
+        set category ""
+        if {$kind eq "\["} {
+            if {![regexp {^\033\[([0-?]*)([ -/]*)([@-~])} $pending seq params intermediate final]} { break }
+            if {$params eq "?2026" && $final in {h l}} {
+                dict lappend stages SYNC_$final [ms [now]]
+                set sync_active [expr {$final eq "h"}]
+            }
+            if {$params eq "?1049" && $final eq "h"} { dict lappend stages ALT_SCREEN [ms [now]] }
+            if {$params in {2 3} && $final eq "J"} { dict lappend stages ERASE [ms [now]] }
+            if {$final eq "c" && $intermediate eq ""} {
+                if {$params in {"" 0}} { set category DA1; set reply "\033\[?1;2c" }
+                if {$params in {> >0}} { set category DA2; set reply "\033\[>0;400;0c" }
+            } elseif {$final eq "q" && $params in {> >0}} {
+                set category XTVERSION; set reply "\033P>|XTerm(400)\033\\"
+            } elseif {$final eq "n" && $params in {6 ?6}} {
+                set category DSR6
+                set private [expr {$params eq "?6" ? "?" : ""}]
+                set reply "\033\[$private$row;${col}R"
+            } elseif {$final eq "n" && $params eq "5"} {
+                set category DSR5; set reply "\033\[0n"
+            } elseif {$final eq "n" && $params eq "?996"} {
+                set category THEME; set reply "\033\[?997;1n"
+            } elseif {$final eq "h" && $params eq "?2031"} {
+                set category THEME; set reply "\033\[?997;1n"
+            } elseif {$final in {H f}} {
+                lassign [split $params \;] r c
+                set row [expr {[string is integer -strict $r] && $r > 0 ? min(40,$r) : 1}]
+                set col [expr {[string is integer -strict $c] && $c > 0 ? min(120,$c) : 1}]
+            } elseif {$final in {A B C D G d}} {
+                set amount [expr {[string is integer -strict $params] && $params > 0 ? $params : 1}]
+                switch -- $final {
+                    A { set row [expr {max(1,$row-$amount)}] }
+                    B { set row [expr {min(40,$row+$amount)}] }
+                    C { set col [expr {min(120,$col+$amount)}] }
+                    D { set col [expr {max(1,$col-$amount)}] }
+                    G { set col [expr {min(120,$amount)}] }
+                    d { set row [expr {min(40,$amount)}] }
+                }
+            } elseif {$final eq "u" && $params eq "?"} {
+                set category KITTY; set reply "\033\[?0u"
+            } elseif {$final eq "p" && $intermediate eq "$" && [regexp {^\?(\d+)$} $params -> mode]} {
+                set category DECRQM
+                set state [expr {$mode in {1004 2004 2026 2031} ? 2 : 0}]
+                set reply "\033\[?$mode;$state\$y"
+            } elseif {$final eq "t" && $params in {14 16 18}} {
+                set category WINDOW
+                switch -- $params {
+                    14 { set reply "\033\[4;800;1200t" }
+                    16 { set reply "\033\[6;20;10t" }
+                    18 { set reply "\033\[8;40;120t" }
+                }
+            } elseif {$final in {c q p n t} && [regexp {^[0-9;?><=]*$} $params]} {
+                dict incr unhandled CSI_$params$intermediate$final
+            }
+        } elseif {$kind in {\] P _ ^}} {
+            if {![regexp {^\033[\]P_^]([^\007\033]*)(?:\007|\033\\)} $pending seq body]} { break }
+            if {$kind eq "\]" && [regexp {^(10|11|12|13|14|15|16|17|19);\?$} $body -> code]} {
+                set category OSC$code
+                set rgb [expr {$code in {10 12 13 15 17} ? "cccc/cccc/cccc" : "1c1c/1c1c/1c1c"}]
+                set reply "\033\]$code;rgb:$rgb\033\\"
+            } elseif {$kind eq "\]" && [string match {4;*} $body]} {
+                set fields [lrange [split $body \;] 1 end]
+                foreach {index value} $fields {
+                    if {$value eq "?" && [string is integer -strict $index] && $index >= 0 && $index < 256} {
+                        set category OSC4
+                        set colors {000000 cd0000 00cd00 cdcd00 0000ee cd00cd 00cdcd e5e5e5 7f7f7f ff0000 00ff00 ffff00 5c5cff ff00ff 00ffff ffffff}
+                        if {$index < 16} {
+                            scan [lindex $colors $index] %2x%2x%2x r g b
+                        } elseif {$index < 232} {
+                            set i [expr {$index-16}]
+                            set levels {0 95 135 175 215 255}
+                            set r [lindex $levels [expr {$i/36}]]
+                            set g [lindex $levels [expr {($i/6)%6}]]
+                            set b [lindex $levels [expr {$i%6}]]
+                        } else { set r [expr {8+10*($index-232)}]; set g $r; set b $r }
+                        append reply [format "\033\]4;%d;rgb:%04x/%04x/%04x\033\\" $index [expr {$r*257}] [expr {$g*257}] [expr {$b*257}]]
+                    }
+                }
+            } elseif {$kind eq "\]" && [regexp {^(\d+);\?$} $body -> code]} {
+                dict incr unhandled OSC_$code
+            } elseif {$kind eq "P" && [regexp {^\+q([0-9a-fA-F;]+)$} $body -> names]} {
+                set category XTGETTCAP
+                foreach name [split $names \;] { append reply "\033P0+r$name\033\\" }
+            } elseif {$kind eq "P" && [string match {$q*} $body]} {
+                set category DECRQSS; set reply "\033P0\$r\033\\"
+            } elseif {$kind eq "P"} {
+                dict incr unhandled DCS
+            }
+        } elseif {$kind in {( ) * +}} {
+            if {[string length $pending] < 3} { break }
+            set seq [string range $pending 0 2]
+        } else { set seq [string range $pending 0 1] }
+        set pending [string range $pending [string length $seq] end]
+        if {$reply ne ""} {
+            if {$category in {OSC10 OSC11}} {
+                color_reply $category $reply
+            } else {
+                if {$client eq ""} { append test_replies $reply } else { send -i $client -- $reply }
+                dict lappend query_times $category [ms [now]]
+            }
+        }
+    }
+    set plain [string range $plain end-65535 end]
+    if {[string length $pending] > 65536} { error "terminal_sequence_exceeded_bound" }
+}
+proc ready {app} {
+    global plain sync_active claude_editor_seen claude_home_evidence
+    if {$sync_active} { return "" }
+    # Ink positions some spaces with cursor-forward rather than literal spaces.
+    regsub -all {\s} [string tolower $plain] {} compact
+    if {[regexp {quicksafetycheck|doyoutrust|yes,itrust|isthisaprojectyoucreated} $compact] &&
+        [string first yes $compact] >= 0 && [string first no $compact] >= 0} { return trust }
+    if {[regexp -nocase {trust this (folder|directory|project)|do you trust|yes, i trust|quick safety check|is this a project you created} $plain]} { return trust }
+    if {[regexp -nocase {sign in with|select.*theme|let.s get started|text style|connect a provider|select a provider} $plain]} { return onboarding }
+    if {$app eq "opencode" && [regexp -nocase {ask anything|ask a question} $plain]} { return home }
+    if {$app eq "claude"} {
+        set banner [regexp {claudecodev[0-9]+\.[0-9]+\.[0-9]+} $compact]
+        set footer [regexp {\?forshortcuts|shift\+tabto|bypasspermissionson} $compact]
+        set welcome [expr {[string first welcomeback $compact] >= 0}]
+        set claude_home_evidence [list banner $banner editor $claude_editor_seen footer $footer welcome $welcome]
+        if {$banner && $claude_editor_seen && $footer} { return home }
+    }
+    return ""
+}
+proc run_trial {app transport guard number {variant normal} {warmup 0}} {
+    global env root
+    # In-memory restoration only: never serialize, print, or log this environment.
+    set saved [array get env]
+    set failed [catch {
+        # Verified at tag v1.18.29: src/effect/runtime-flags.ts, src/plugin/index.ts,
+        # src/plugin/tui/runtime.ts, src/skill/index.ts; CLI docs list DEFAULT_PLUGINS.
+        # PURE skips external server AND TUI plugins, not their config discovery.
+        switch -- $variant {
+            normal {}
+            osc_immediate - osc_delay200 - osc_omit - osc_pair250 {}
+            pure { set env(OPENCODE_PURE) 1 }
+            no_default_plugins { set env(OPENCODE_DISABLE_DEFAULT_PLUGINS) true }
+            pure_no_default_plugins {
+                set env(OPENCODE_PURE) 1
+                set env(OPENCODE_DISABLE_DEFAULT_PLUGINS) true
+            }
+            no_external_skills { set env(OPENCODE_DISABLE_EXTERNAL_SKILLS) true }
+            isolated_default {
+                # Keep terminal, locale, executable lookup, and shell identical. In particular,
+                # do not carry OPENCODE_CONFIG_CONTENT, API keys, or other agents' config roots.
+                foreach name [array names env] {
+                    if {$name ni {PATH SHELL LANG LC_ALL LC_CTYPE TZ TERM COLORTERM PWD AFT_DISABLE}} { unset env($name) }
+                }
+                set base [file join $root default]
+                foreach {name directory} {
+                    HOME home USERPROFILE home OPENCODE_TEST_HOME home
+                    XDG_CONFIG_HOME config XDG_DATA_HOME data XDG_STATE_HOME state
+                    XDG_CACHE_HOME cache XDG_RUNTIME_DIR runtime TMPDIR tmp
+                    CLAUDE_CONFIG_DIR claude CODEX_HOME codex
+                } {
+                    set env($name) [file join $base $directory]
+                    file mkdir $env($name)
+                    file attributes $env($name) -permissions 0700
+                }
+            }
+            default { error "unknown_variant" }
+        }
+        trial $app $transport $guard $number $variant $warmup
+        if {$variant eq "isolated_default"} {
+            # Verify the app used the private XDG roots, without opening any generated files.
+            foreach directory {config data state cache} {
+                if {![file isdirectory [file join $root default $directory opencode]]} {
+                    error "default_${directory}_isolation_not_observed"
+                }
+            }
+            puts "PROFILE variant=isolated_default trial=$number private_xdg_observed=1"
+        }
+    } failure options]
+    # Deleting the whole Tcl env array removes its OS-environment trace. Unset only
+    # entries, otherwise subsequent variants silently inherit the first process environment.
+    foreach name [array names env] { unset env($name) }
+    array set env $saved
+    if {$failed} { return -options $options $failure }
+}
+proc trial {app transport guard trial {variant normal} {warmup 0}} {
+    global env root socket tmux handles client owned began peak first_text query_times pending plain row col results unhandled mode samplers stages sync_active executables tmux_paths
+    global color_policy color_queue color_pairs color_requests color_delays color_packets
+    global project_kind claude_editor_seen claude_home_evidence
+    set claude_editor_seen 0
+    set claude_home_evidence {}
+    set color_policy [expr {$mode eq "theme" ? $variant : "osc_immediate"}]
+    set color_queue {}
+    set color_pairs [dict create OSC10 {} OSC11 {}]
+    set color_requests [dict create]
+    set color_delays [dict create]
+    set color_packets 0
+    set peak 0
+    set owned [dict create]
+    set handles {}
+    foreach name {TMUX TMUX_PANE TMUX_TMPDIR} { unset -nocomplain env($name) }
+    if {$guard eq "disabled"} { set env(AFT_DISABLE) 1 } else { unset -nocomplain env(AFT_DISABLE) }
+    set executable [dict get $executables $app]
+    set bind_ms 0
+    if {$transport ne "direct"} {
+        set tmux [dict get $tmux_paths [lindex [split $transport -] 0]]
+        set env(AFT_TMUX_BINARY) $tmux
+        set socket [file join $root s]
+        # A fresh server, empty configuration, inert pane. App launches only after attach.
+        tm -f /dev/null new-session -d -s profile -x 120 -y 40 -c [pwd] /bin/sleep 60
+        own [tm display-message -p {#{pid}}]
+        own [tm display-message -p -t profile: {#{pane_pid}}]
+        tm set-option -g status off
+        tm set-option -g default-terminal xterm-256color
+        tm set-option -g window-style fg=#cccccc,bg=#1c1c1c
+        if {[string match *bind $transport]} {
+            set start [now]
+            # Isolate only bind's ownership journal; applications keep their actual state paths.
+            exec /usr/bin/env XDG_STATE_HOME=[file join $root bind-state] [dict get $executables agent-float-term] bind --socket $socket > /dev/null 2> /dev/null
+            set bind_ms [format %.1f [expr {([now]-$start)/1000.0}]]
+        }
+        spawn -noecho $tmux -S $socket attach-session -E -t profile
+    } else {
+        set began [now]
+        spawn -noecho $executable
+    }
+    set client $spawn_id
+    set app_pid [exp_pid -i $client]
+    lappend handles $client
+    own [exp_pid -i $client]
+    match_max -i $client 262144
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    set pending ""
+    set plain ""
+    set first_text ""
+    set query_times [dict create]
+    set stages [dict create]
+    set sync_active 0
+    set unhandled [dict create]
+    set row 1
+    set col 1
+    if {$transport ne "direct"} {
+        set began [now]
+        # Service tmux's own capability queries before measuring application startup.
+        set deadline [expr {[now]+500000}]
+        while {[now] < $deadline} {
+            expect -i $client -timeout 0 -re {.+} { terminal $expect_out(0,string) } timeout {} eof {error "client_exited"}
+            after 2
+        }
+        set pending ""
+        set plain ""
+        set first_text ""
+        set query_times [dict create]
+        set stages [dict create]
+        set sync_active 0
+        set began [now]
+        tm respawn-pane -k -t profile: -c [pwd] $executable
+        set app_pid [tm display-message -p -t profile: {#{pane_pid}}]
+        own $app_pid
+    }
+    set first_byte ""
+    set ended ""
+    set kind ""
+    set last_sample 0
+    set diagnostics [dict create]
+    set last_output $began
+    set max_gap 0
+    set observations {}
+    set last_diagnostic 0
+    set sample_channel ""
+    set stack ""
+    set sample_start ""
+    set deadline [expr {$began+($variant eq "isolated_default" && $warmup ? 60000000 : 20000000)}]
+    while {[now] < $deadline && $kind eq ""} {
+        flush_colors
+        expect -i $client -timeout 0 -re {.+} {
+            set t [now]
+            if {$first_byte eq ""} { set first_byte $t }
+            set max_gap [expr {max($max_gap,$t-$last_output)}]
+            set last_output $t
+            terminal $expect_out(0,string)
+            set kind [ready $app]
+            if {$kind ne ""} { set ended [now] }
+        } timeout {} eof { set kind early_exit; set ended [now] }
+        foreach label {MCP keychain authentication ECONNREFUSED ENOTFOUND ETIMEDOUT plugin migration downloading connecting loading Claude Code trust workspace folder safety Enter continue Press API key Welcome settings terminal error accept auth Yes No login theme select color custom initializing starting permission credentials} {
+            if {![dict exists $diagnostics $label] && [string first [string tolower $label] [string tolower $plain]] >= 0} {
+                dict set diagnostics $label [ms [now]]
+            }
+        }
+        # A synchronous ps snapshot must not push a scheduled reply across the 250ms
+        # theme-refresh boundary. Keep the usual ownership sampling outside that window.
+        set sample_safe 1
+        foreach item $color_queue {
+            if {[lindex $item 0]-[now] < 50000} { set sample_safe 0; break }
+        }
+        if {$sample_safe && [now]-$last_sample > 100000} { remember; set last_sample [now] }
+        if {$mode in {diagnose sample} && ([now]-$last_diagnostic > 250000 || $kind ne "")} {
+            set phase [expr {$first_byte eq "" ? "before_terminal" : $kind eq "" ? "after_terminal" : "ready"}]
+            lappend observations [diagnostic $app_pid $phase]
+            set last_diagnostic [now]
+        }
+        if {$mode eq "sample" && $sample_channel eq ""} {
+            set sample_start [ms [now]]
+            # Stream into memory, not sample's default disk report. Never emit stack text.
+            set sample_channel [open [list | /usr/bin/sample $app_pid 1 10 -file /dev/stdout 2>/dev/null] r]
+            lappend samplers $sample_channel
+            fconfigure $sample_channel -blocking 0
+            foreach pid [pid $sample_channel] { own $pid }
+        }
+        if {$sample_channel ne ""} {
+            append stack [read $sample_channel 1048576]
+            set stack [string range $stack end-2097151 end]
+        }
+        if {$kind eq ""} { after 2 }
+    }
+    if {$kind eq ""} { set kind timeout; set ended [now] }
+    set elapsed [ms $ended]
+    if {$first_byte ne ""} { set first_byte [ms $first_byte] } else { set first_byte NA }
+    if {$first_text ne ""} { set first_text [ms $first_text] } else { set first_text NA }
+    set queries {}
+    dict for {category times} $query_times {
+        lappend queries "$category:[llength $times]:[lindex $times 0]-[lindex $times end]"
+    }
+    set output_stages {}
+    dict for {category times} $stages {
+        lappend output_stages "$category:[llength $times]:[lindex $times 0]-[lindex $times end]"
+    }
+    puts "PROFILE app=$app project=$project_kind transport=$transport guard=$guard variant=$variant trial=$trial warmup=$warmup ready=$kind total_ms=$elapsed first_byte_ms=$first_byte first_text_ms=$first_text max_silent_ms=[format %.1f [expr {$max_gap/1000.0}]] trailing_silent_ms=[format %.1f [expr {($ended-$last_output)/1000.0}]] text_chars=[string length $plain] pending_bytes=[string length $pending] owned_peak=$peak bind_ms=$bind_ms queries=[join $queries ,] unhandled=[join $unhandled ,] categories=[join $diagnostics ,]"
+    if {$app eq "claude"} { puts "CLAUDE_FRAME trial=$trial evidence=[join $claude_home_evidence ,] home_reached=[expr {$kind eq "home"}]" }
+    foreach observation $observations { puts "DIAGNOSTIC app=$app trial=$trial $observation" }
+    puts "TERMINAL app=$app transport=$transport guard=$guard variant=$variant trial=$trial stages=[join $output_stages ,]"
+    if {$mode eq "theme"} {
+        set requests {}
+        set delays {}
+        set first_color ""
+        dict for {category times} $color_requests {
+            lappend requests "$category:[llength $times]:[lindex $times 0]-[lindex $times end]"
+            if {$first_color eq "" || [lindex $times 0] < $first_color} { set first_color [lindex $times 0] }
+        }
+        dict for {category times} $color_delays {
+            set sorted [lsort -real $times]
+            lappend delays "$category:[llength $times]:[lindex $sorted 0]-[lindex $sorted end]"
+        }
+        puts "COLORS variant=$variant trial=$trial requests=[join $requests ,] reply_latency_ms=[join $delays ,] packets=$color_packets queued=[llength $color_queue] unpaired=[expr {[llength [dict get $color_pairs OSC10]]+[llength [dict get $color_pairs OSC11]]}]"
+        if {!$warmup && $first_color ne ""} {
+            dict lappend results "$app/$transport/$guard/$variant/$kind/after_color_query" [format %.1f [expr {$elapsed-$first_color}]]
+        }
+    }
+    if {$sample_channel ne ""} {
+        set frames ""
+        foreach line [split $stack \n] {
+            if {[regexp {^\s*[+!:| ]*\d+\s+(.+\(in .*)$} $line -> frame]} { append frames $frame \n }
+        }
+        set stack_categories {}
+        foreach {category pattern} {
+            javascript_parse {JSC::.*(Parser|Lexer|parse|BytecodeGenerator|UnlinkedCodeBlock)}
+            javascript_compile {JSC::.*(compile|Compilation|DFG|FTL|JIT)}
+            javascript_execute {JSC::.*(execute|Interpreter|call)|llint_|vmEntry}
+            module_load {moduleLoader|ModuleLoader|evaluateModule|loadModule|linkModule|fetchModule}
+            garbage_collection {JSC::.*(Heap|GC|Scavenger|SlotVisitor|MarkedBlock)}
+            filesystem {readFile|openat|stat64|pread|uv_fs_|Bun__read}
+            network_tls {SSL_|TLS|CFNetwork|\mconnect\M|__connect|tcp_connect}
+            credential {SecItem|Security::|keychain}
+            idle_wait {kevent|pthread_cond_wait|__psynch_cvwait|mach_msg}
+            app_native_unsymbolicated {\(in opencode\) \+}
+        } {
+            if {[regexp -- $pattern $frames]} { lappend stack_categories $category }
+        }
+        puts "STACK app=$app trial=$trial started_ms=$sample_start duration_requested_ms=1000 complete=[eof $sample_channel] categories=[join $stack_categories ,]"
+        set stack ""
+    }
+    flush stdout
+    if {!$warmup} { dict lappend results "$app/$transport/$guard/$variant/$kind" $elapsed }
+    set plain ""
+    set pending ""
+    cleanup
+}
+set peak 0
+if {[catch {
+    if {$argc == 1 && [lindex $argv 0] eq "selftest"} {
+        set client ""
+        set pending ""
+        set plain ""
+        set first_text ""
+        set query_times [dict create]
+        set stages [dict create]
+        set sync_active 0
+        set unhandled [dict create]
+        set test_replies ""
+        set row 1
+        set col 1
+        set began [now]
+        set input "\033\[c\033\[>c\033\[>q\033\]10;?\007\033\]11;?\033\\\033\]4;0;?;255;?\007\033\[4;9H\033\[6n"
+        foreach byte [split $input ""] { terminal $byte }
+        set expected "\033\[?1;2c\033\[>0;400;0c\033P>|XTerm(400)\033\\\033\]10;rgb:cccc/cccc/cccc\033\\\033\]11;rgb:1c1c/1c1c/1c1c\033\\\033\]4;0;rgb:0000/0000/0000\033\\\033\]4;255;rgb:eeee/eeee/eeee\033\\\033\[4;9R"
+        if {$test_replies ne $expected || $pending ne ""} { error "fragmented_vt_response_mismatch" }
+        set pair "\033\]10;rgb:cccc/cccc/cccc\033\\\033\]11;rgb:1c1c/1c1c/1c1c\033\\"
+        foreach policy {osc_delay200 osc_omit osc_pair250} {
+            set color_policy $policy
+            set test_replies ""
+            set before_packets $color_packets
+            terminal "\033\]10;?\007\033\]11;?\007"
+            flush_colors
+            if {$test_replies ne ""} { error "color_response_delivered_too_early" }
+            after 260
+            flush_colors
+            set wanted [expr {$policy eq "osc_omit" ? "" : $pair}]
+            set packets [expr {$policy eq "osc_omit" ? 0 : $policy eq "osc_pair250" ? 1 : 2}]
+            if {$test_replies ne $wanted || $color_packets-$before_packets != $packets} { error "color_delivery_policy_failed" }
+        }
+        set color_policy osc_immediate
+        terminal "Quick\033\[1Csafety\033\[1Ccheck Yes,\033\[1CI\033\[1Ctrust\033\[1Cthis\033\[1Cfolder No"
+        if {[ready claude] ne "trust"} { error "positioned_trust_detection_failed" }
+        terminal "\033\[?2026h"
+        if {[ready claude] ne ""} { error "uncommitted_frame_reported_ready" }
+        terminal "\033\[?2026l"
+        if {[ready claude] ne "trust"} { error "committed_frame_not_ready" }
+        set plain {debug history inner style: Claude Code v2.1.263 Welcome back}
+        set claude_editor_seen 0
+        if {[ready claude] ne ""} { error "welcome_text_reported_as_home" }
+        set row 10
+        set col 2
+        terminal "\u276f"
+        if {[ready claude] ne ""} { error "editor_without_footer_reported_ready" }
+        terminal "\r\n?\033\[1Cfor\033\[1Cshortcuts"
+        if {[ready claude] ne "home"} { error "claude_home_frame_not_recognized" }
+        set env(AFT_PROFILE_TEST_RESTORE) before
+        set before [lsort [array get env]]
+        rename trial real_trial
+        proc trial {args} {
+            global env
+            set env(AFT_PROFILE_TEST_RESTORE) changed
+            exec /bin/sh -c {test "$OPENCODE_PURE" = 1 && test "$AFT_PROFILE_TEST_RESTORE" = changed}
+            error "intentional_test_error"
+        }
+        set caught [catch {run_trial opencode direct disabled 1 pure} failure]
+        if {!$caught || $failure ne "intentional_test_error" || [lsort [array get env]] ne $before} {
+            error "variant_environment_not_restored"
+        }
+        exec /bin/sh -c {test "$AFT_PROFILE_TEST_RESTORE" = before}
+        unset env(AFT_PROFILE_TEST_RESTORE)
+        exec /bin/sh -c {test "${AFT_PROFILE_TEST_RESTORE+x}" != x}
+        rename trial {}
+        rename real_trial trial
+        puts "PROFILE selftest=passed fragmented_queries=1 color_delivery=1 positioned_trust=1 synchronized_frame=1 claude_home=1 environment_restore=1"
+        exit 0
+    }
+    if {$argc < 1 || $argc > 2 || [lindex $argv 0] ni {direct tmux all claude opencode diagnose sample variants theme}} { error "invalid_profile_mode_or_arguments" }
+    set mode [lindex $argv 0]
+    if {![info exists env(AFT_PROFILE_CONSENT)] || $env(AFT_PROFILE_CONSENT) ne "1"} { error "explicit_profile_consent_required" }
+    if {![info exists env(AFT_DISABLE)] || $env(AFT_DISABLE) ne "1"} { error "outer_disable_guard_required" }
+    if {$tcl_platform(os) ne "Darwin"} { error "process_identity_checks_require_macos" }
+    if {[info exists env(AFT_PROFILE_PROJECT)]} {
+        if {$env(AFT_PROFILE_PROJECT) eq ""} { error "selected_project_unavailable" }
+        set existing_project [file normalize $env(AFT_PROFILE_PROJECT)]
+        if {![file isdirectory $existing_project]} { error "selected_project_unavailable" }
+        set project_kind existing
+    }
+    set direct_guards {disabled unset}
+    if {[info exists env(AFT_PROFILE_GUARDS)]} {
+        set direct_guards $env(AFT_PROFILE_GUARDS)
+        if {[llength $direct_guards] < 1 || [llength $direct_guards] > 2} { error "invalid_direct_guard_selection" }
+        foreach guard $direct_guards { if {$guard ni {disabled unset}} { error "invalid_direct_guard_selection" } }
+        set direct_guards [lsort -unique $direct_guards]
+    }
+    puts "PROFILE mode=$mode project=$project_kind direct_guards=[join $direct_guards ,]"
+    set executables [dict create]
+    set apps [expr {$mode in {claude opencode} ? [list $mode] : $mode in {variants theme diagnose sample} ? {opencode} : {claude opencode}}]
+    foreach app $apps {
+        dict set executables $app [executable $app]
+    }
+    set tmux_paths [dict create]
+    set transports {direct}
+    if {$mode in {tmux all claude opencode}} {
+        if {[info exists env(AFT_PROFILE_TMUX_OLD)]} { dict set tmux_paths old $env(AFT_PROFILE_TMUX_OLD) }
+        if {[info exists env(AFT_PROFILE_TMUX_CURRENT)]} {
+            dict set tmux_paths current $env(AFT_PROFILE_TMUX_CURRENT)
+        } elseif {$mode in {tmux all}} { dict set tmux_paths current [executable tmux] }
+        if {[dict size $tmux_paths]} { dict set executables agent-float-term [executable agent-float-term] }
+        if {$mode eq "tmux"} { set transports {} }
+        dict for {label path} $tmux_paths {
+            if {[file pathtype $path] ne "absolute" || ![file executable $path]} { error "tmux_executable_unavailable" }
+            if {![regexp {^tmux ([0-9][0-9.a-z]*)$} [exec $path -V] -> version]} { error "unexpected_tmux_version" }
+            puts "PROFILE transport=$label tmux_version=$version"
+            lappend transports $label-plain $label-bind
+        }
+    }
+    set trials [expr {$argc == 2 ? [lindex $argv 1] : $mode in {variants theme} ? 5 : 3}]
+    if {![string is integer -strict $trials] || $trials < 1 || $trials > 5} { error "trials_must_be_1_to_5" }
+    if {$mode in {variants theme} && $trials < 4} { error "comparison_requires_4_or_5_trials_including_warmup" }
+    set scratch [expr {[info exists env(TMPDIR)] && $env(TMPDIR) ne "" ? $env(TMPDIR) : "/tmp"}]
+    if {![file isdirectory $scratch]} { error "temporary_parent_unavailable" }
+    set scratch [file normalize $scratch]
+    if {$existing_project ne "" && ($scratch eq $existing_project ||
+        [string first "$existing_project/" "$scratch/"] == 0 || $existing_project eq "/")} {
+        error "temporary_parent_inside_existing_project"
+    }
+    set root [exec /usr/bin/mktemp -d [file join $scratch aft-start.XXXXXX]]
+    if {[dict size $tmux_paths] && [string length [file join $root s]] >= 104} { error "temporary_socket_path_too_long" }
+    file attributes $root -permissions 0700
+    if {$existing_project eq ""} {
+        file mkdir [file join $root project]
+        cd [file join $root project]
+    } else { cd $existing_project }
+    set env(PWD) [pwd]
+    set env(TERM) xterm-256color
+    set env(COLORTERM) truecolor
+    # Do not advertise a native GUI whose proprietary responses we do not emulate.
+    foreach name {TERM_PROGRAM TERM_PROGRAM_VERSION GHOSTTY_RESOURCES_DIR GHOSTTY_BIN_DIR} { unset -nocomplain env($name) }
+    set variants {normal}
+    if {$mode eq "theme"} {
+        if {[string trim [exec [dict get $executables opencode] --version]] ne "1.18.29"} { error "theme_probe_requires_review_for_installed_version" }
+        set variants {osc_immediate osc_delay200 osc_omit osc_pair250}
+        puts "PROFILE comparison=theme configured=1 launches_per_case=$trials excluded_first_launch=1"
+    }
+    if {$mode eq "variants"} {
+        if {[string trim [exec [dict get $executables opencode] --version]] ne "1.18.29"} { error "variant_flags_require_review_for_installed_version" }
+        set variants {normal pure no_default_plugins pure_no_default_plugins no_external_skills isolated_default}
+        # No contents are inspected. Refuse to call defaults fully isolated if machine-wide
+        # policy or ancestor config would still be loaded under a private HOME.
+        set isolated [expr {$existing_project eq ""}]
+        if {[file exists "/Library/Application Support/opencode"] ||
+            [llength [glob -nocomplain -directory "/Library/Managed Preferences" ai.opencode.managed.plist */ai.opencode.managed.plist]]} {
+            set isolated 0
+        }
+        for {set cursor [pwd]} {1} {set cursor [file dirname $cursor]} {
+            foreach name {opencode.json opencode.jsonc tui.json tui.jsonc .opencode .claude .agents} {
+                if {[file exists [file join $cursor $name]]} { set isolated 0 }
+            }
+            if {[file dirname $cursor] eq $cursor} { break }
+        }
+        if {!$isolated} {
+            set variants [lrange $variants 0 end-1]
+            set reason [expr {$existing_project ne "" ? "existing_project_selected" : "machine_or_ancestor_configuration_present"}]
+            puts "PROFILE variant=isolated_default skipped=$reason"
+        }
+        foreach name {OPENCODE_PURE OPENCODE_DISABLE_DEFAULT_PLUGINS OPENCODE_DISABLE_EXTERNAL_SKILLS} {
+            set enabled [expr {[info exists env($name)] && [string tolower $env($name)] in {1 true}}]
+            puts "PROFILE baseline_flag=$name enabled=$enabled"
+        }
+        puts "PROFILE comparison=variants launches_per_case=$trials excluded_first_launch=1 cache=private_for_defaults"
+    }
+    for {set i 1} {$i <= $trials} {incr i} {
+        if {$mode in {variants theme}} {
+            # Rotate order after recording each variant's first launch; do not interleave processes.
+            set shift [expr {($i-1)%[llength $variants]}]
+            set order [concat [lrange $variants $shift end] [lrange $variants 0 [expr {$shift-1}]]]
+            foreach variant $order { run_trial opencode direct disabled $i $variant [expr {$i == 1}] }
+            continue
+        }
+        foreach app $apps {
+            foreach transport $transports {
+                set guards [expr {$transport eq "direct" && $mode ni {diagnose sample} ? ($i%2 ? $direct_guards : [lreverse $direct_guards]) : {disabled}}]
+                foreach guard $guards { run_trial $app $transport $guard $i }
+            }
+        }
+    }
+    dict for {key values} $results {
+        set values [lsort -real $values]
+        set n [llength $values]
+        set median [expr {([lindex $values [expr {($n-1)/2}]]+[lindex $values [expr {$n/2}]])/2.0}]
+        puts "SUMMARY case=$key n=$n p50_ms=[format %.1f $median] min_ms=[lindex $values 0] max_ms=[lindex $values end]"
+    }
+    teardown
+} failure]} {
+    # Tcl errors may embed terminal text or subprocess diagnostics. Never emit them.
+    set line 0
+    if {[info exists errorInfo] && [regexp {\(file "[^"\n]+" line (\d+)\)} $errorInfo -> found]} { set line $found }
+    set category internal_error
+    if {[regexp {^[a-z_0-9]+$} $failure]} { set category $failure }
+    catch {teardown}
+    puts stderr "PROFILE failed category=$category line=$line cleanup_attempted=1"
+    exit 1
+}

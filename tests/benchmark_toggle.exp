@@ -1,0 +1,326 @@
+#!/usr/bin/env expect
+# Research only: isolated real PTYs, native inert fixture, no model or user config.
+# Usage: expect tests/benchmark_toggle.exp CLI TMUX [cold_samples=5] [warm_per_cold=5]
+# Runs bare timings first, then an exec-only shell shim for independent RPC counts.
+set timeout 15
+log_user 0
+if {$argc < 2 || $argc > 4} {
+    puts stderr "usage: expect tests/benchmark_toggle.exp CLI TMUX ?cold_samples? ?warm_per_cold?"
+    exit 1
+}
+set binary [file normalize [lindex $argv 0]]
+set tmux [file normalize [lindex $argv 1]]
+set cold_samples 5
+set warm_samples 5
+if {$argc > 2} { set cold_samples [lindex $argv 2] }
+if {$argc > 3} { set warm_samples [lindex $argv 3] }
+foreach n [list $cold_samples $warm_samples] {
+    if {![string is integer -strict $n] || $n < 5} { error "use at least five samples" }
+}
+set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
+set root ""
+set socket ""
+set client ""
+set frame ""
+set trace ""
+set observer {}
+set results [dict create]
+set counts [dict create]
+
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc now {} { return [clock clicks -microseconds] }
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket {*}$args]
+}
+proc write_private {path contents} {
+    set out [open $path {WRONLY CREAT TRUNC} 0600]
+    puts $out $contents
+    close $out
+}
+proc quote {value} { return "'[string map [list ' '\\''] $value]'" }
+proc drain {} {
+    global client frame
+    expect -i $client -timeout 0 -re {.+} {
+        append frame $expect_out(0,string)
+        # Only our synthetic terminal is observed, and the buffer stays bounded.
+        set frame [string range $frame end-65535 end]
+    } timeout {} eof { error "private client exited" }
+}
+proc wait_for {script message} {
+    set deadline [expr {[now] + 15000000}]
+    while {[now] < $deadline} {
+        drain
+        if {[uplevel 1 $script]} { return [now] }
+        after 5
+    }
+    error "timed out: $message"
+}
+proc client_count {} {
+    global observer
+    set start [now]
+    set listing [tm list-clients -F {#{client_pid}}]
+    lappend observer [expr {([now] - $start) / 1000.0}]
+    if {[string trim $listing] eq ""} { return 0 }
+    return [llength [split [string trim $listing] \n]]
+}
+proc has_frame {marker} {
+    global frame
+    return [expr {[string first $marker $frame] >= 0}]
+}
+proc type {text} {
+    global client
+    send -i $client -- $text
+}
+proc record {mode phase metric start end} {
+    global results
+    dict lappend results "$mode/$phase/$metric" [expr {($end - $start) / 1000.0}]
+}
+proc stats {values} {
+    set sorted [lsort -real $values]
+    set n [llength $sorted]
+    # Nearest-rank percentiles; cold p95 at n=5 is the maximum, not a tail estimate.
+    return [format "n=%d p50=%.2f p95=%.2f min=%.2f max=%.2f" $n \
+        [lindex $sorted [expr {int(ceil($n * 0.50)) - 1}]] \
+        [lindex $sorted [expr {int(ceil($n * 0.95)) - 1}]] \
+        [lindex $sorted 0] [lindex $sorted end]]
+}
+proc trace_commands {mode phase operation} {
+    global trace counts
+    if {$mode ne "shim"} { return {} }
+    set lines [split [string trim [read $trace]] \n]
+    if {$lines eq [list ""]} { set lines {} }
+    dict lappend counts "$phase/$operation" [llength $lines]
+    return $lines
+}
+proc teardown {} {
+    global root socket client tmux trace
+    if {$socket ne "" && [file exists $socket]} { catch {tm kill-server} }
+    if {$client ne ""} {
+        catch {close -i $client}
+        catch {wait -i $client}
+    }
+    if {$trace ne ""} { catch {close $trace} }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+
+set failed [catch {
+    # Override TMPDIR if the platform's default would exceed the socket limit.
+    set scratch /tmp
+    if {[info exists env(TMPDIR)]} { set scratch $env(TMPDIR) }
+    set root [file normalize [exec mktemp -d [file join $scratch aft-b.XXXXXX]]]
+    set socket [file join $root s]
+    check {[string length $socket] < 104} "choose a shorter TMPDIR for the private socket"
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) /usr/bin:/bin:/usr/sbin:/sbin
+    set env(HOME) [file join $root home]
+    set env(XDG_CONFIG_HOME) [file join $root config]
+    set env(XDG_DATA_HOME) [file join $root data]
+    set env(XDG_STATE_HOME) [file join $root state]
+    set env(XDG_RUNTIME_DIR) [file join $root runtime]
+    set env(SHELL) /bin/bash
+    set env(TERM) xterm-256color
+    set env(PS1) {AFT_BENCH_PROMPT> }
+    set env(PROMPT_COMMAND) ""
+    set env(LC_ALL) C
+    foreach directory [list $env(HOME) $env(XDG_CONFIG_HOME) $env(XDG_DATA_HOME) \
+        $env(XDG_STATE_HOME) $env(XDG_RUNTIME_DIR) [file join $root bin] \
+        [file join $env(XDG_CONFIG_HOME) agent-float-term]] {
+        file mkdir $directory
+        file attributes $directory -permissions 0700
+    }
+    set claude [file join $root bin claude]
+    exec /usr/bin/cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
+    set env(PATH) "[file join $root bin]:$env(PATH)"
+    write_private [file join $env(XDG_CONFIG_HOME) agent-float-term config.toml] \
+        "shell = '/bin/bash'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    # Interactive, non-login Bash reads only our empty HOME's startup files.
+    write_private [file join $env(HOME) .bashrc] {PS1='AFT_BENCH_PROMPT> '; unset PROMPT_COMMAND}
+    set log [file join $root rpc.log]
+    write_private $log ""
+    set shim [file join $root bin tmux]
+    write_private $shim "#!/bin/sh\nprintf '%s\\n' \"\$*\" >> [quote $log]\nexec [quote $tmux] \"\$@\""
+    file attributes $shim -permissions 0700
+    check {[exec $shim -V] eq [exec $tmux -V]} "shim must preserve the real version"
+    set trace [open $log r]
+    puts "BENCH [exec $tmux -V] CLI=$binary cold=$cold_samples warm_per_cold=$warm_samples poll_sleep_ms=5"
+
+    foreach mode {bare shim} {
+        if {$mode eq "bare"} { set env(AFT_TMUX_BINARY) $tmux } else { set env(AFT_TMUX_BINARY) $shim }
+        tm -f /dev/null new-session -d -s outer -c $env(HOME) /bin/bash --noprofile --norc -i
+        tm set-option -g default-shell /bin/bash
+        tm set-option -g status off
+        # Match the PTY tests, not any user's bindings or escape-time tuning.
+        tm set-option -g escape-time 100
+        exec $binary bind --socket $socket
+        set outer [tm display-message -p -t outer: {#{pane_id}}]
+        spawn -noecho $tmux -S $socket attach-session -t outer
+        set client $spawn_id
+        match_max -i $client 65536
+        stty rows 40 columns 120 < $spawn_out(slave,name)
+        wait_for {expr {[client_count] == 1}} "outer attachment"
+        wait_for {has_frame AFT_BENCH_PROMPT} "outer prompt"
+        type "printf '\\033\[2J\\033\[H'; [quote $claude]\r"
+        wait_for {has_frame {AFT_READY claude}} "native mapped fixture ready"
+        set outer_before [tm capture-pane -p -t $outer]
+        check {[string first AFT_BENCH_PROMPT $outer_before] < 0} "outer frame contains a stale prompt marker"
+        set outer_tty [tm list-clients -F {#{client_name}}]
+        seek $trace 0 end
+
+        for {set cold 0} {$cold < $cold_samples} {incr cold} {
+            set retained_pid ""
+            for {set cycle 0} {$cycle <= $warm_samples} {incr cycle} {
+                set phase warm
+                if {$cycle == 0} { set phase cold }
+                tm set-option -g @aft_last_error BENCH_PENDING
+                drain
+                set frame ""
+                set start [now]
+                type "\033\[18~"
+                set attached [wait_for {expr {[client_count] == 2}} "F7 popup attachment"]
+                record $mode $phase attached $start $attached
+                set opening [trace_commands $mode $phase open]
+                if {$mode eq "shim"} {
+                    set correct_target 0
+                    foreach line $opening {
+                        if {[string first " display-popup -E " $line] >= 0 &&
+                            [string first " -c $outer_tty -t $outer " $line] >= 0} {
+                            set correct_target 1
+                        }
+                    }
+                    check {$correct_target} "display-popup did not target the invoking client's TTY"
+                }
+                set prompt [wait_for {has_frame AFT_BENCH_PROMPT} "popup prompt frame"]
+                record $mode $phase prompt_frame $start $prompt
+                if {$phase eq "cold"} {
+                    # Prompt/attachment alone does not prove the shell accepts input.
+                    # Builtin read consumes a second line; the joined result marker
+                    # cannot be mistaken for the echoed command or PS1.
+                    # Let readline hand the terminal back before sending read's
+                    # input. A single multi-line send can stay in readline's buffer.
+                    type "printf 'AFT_READ_%s\\n' WAITING; IFS= read -r value; printf 'AFT_READ_%s\\n' \"\$value\"\r"
+                    wait_for {has_frame AFT_READ_WAITING} "cold shell read handoff"
+                    type "READY\r"
+                    set ready [wait_for {has_frame AFT_READ_READY} "cold shell read/response"]
+                    record $mode $phase read_response $start $ready
+                }
+                set floats [tm list-panes -a -F {#{pane_id}|#{@aft_owner}|#{pane_pid}|#{session_id}}]
+                set float ""
+                foreach line [split $floats \n] {
+                    lassign [split $line |] pane owner pid session
+                    if {$owner eq $outer} {
+                        check {$float eq ""} "duplicate owned float"
+                        set float $pane
+                        set float_session $session
+                        if {$retained_pid eq ""} { set retained_pid $pid }
+                        check {$retained_pid eq $pid} "warm toggle replaced the shell"
+                    }
+                }
+                check {$float ne ""} "owned float missing"
+                drain
+                set frame ""
+                set start [now]
+                type "\033\[18~"
+                set hidden [wait_for {expr {[client_count] == 1}} "F7 hide"]
+                record $mode $phase hidden $start $hidden
+                set settled [wait_for {
+                    expr {[tm display-message -p -t $float {#{@aft_worker}|#{@aft_last_error}}] eq "|"}
+                } "worker claim and dispatch error cleanup"]
+                record $mode $phase settled $start $settled
+                set closing [trace_commands $mode $phase hide_cleanup]
+                if {$mode eq "shim" && $cold == 0 && $cycle <= 1} {
+                    # Print command/option frequencies only, never raw argv, panes or profiles.
+                    foreach pair [list [list open $opening] [list hide_cleanup $closing]] {
+                        lassign $pair operation lines
+                        set histogram [dict create]
+                        foreach line $lines {
+                            set words [split $line " "]
+                            set index 0
+                            while {[lindex $words $index] in {-S -T -f}} { incr index 2 }
+                            set command [lindex $words $index]
+                            dict incr histogram $command
+                        }
+                        puts "RPC $phase/$operation $histogram"
+                    }
+                }
+                check {[tm capture-pane -p -t $outer] eq $outer_before} "input leaked into the inert harness"
+                after 20
+            }
+            if {$mode eq "bare" && $cold == $cold_samples - 1} {
+                # Read-only microbenchmark, outside toggle samples. These are the
+                # twelve server queries on the original warm path; -V is local.
+                set queries [list \
+                    [list display-message -p -t $outer {#{pane_id}|#{pane_pid}|#{pane_tty}|#{session_id}|#{pane_dead}|#{pane_in_mode}}] \
+                    [list list-clients -F {#{client_pid}|#{client_name}|#{pane_id}}] \
+                    [list display-message -p {#{version}}] \
+                    [list show-options -gqv exit-unattached] \
+                    [list show-options -gqv destroy-unattached] \
+                    [list show-options -gqv @aft_generation] \
+                    [list list-sessions -F {#{session_id}|#{@aft_owner}|#{@aft_float_generation}}] \
+                    [list show-options -qv -t $float_session @aft_owner] \
+                    [list show-options -qv -t $float_session @aft_float_generation] \
+                    [list display-message -p -t $float_session {#{session_attached}}] \
+                    [list show-options -qv -t $float_session @aft_worker] \
+                    [list list-clients -F {#{client_pid}|#{client_name}|#{pane_id}}]]
+                set batch {}
+                foreach query $queries {
+                    if {[llength $batch]} { lappend batch {;} }
+                    lappend batch {*}$query
+                }
+                for {set sample 0} {$sample < 25} {incr sample} {
+                    set expected {}
+                    set start [now]
+                    foreach query $queries { lappend expected [tm {*}$query] }
+                    record probe metadata sequential_12 $start [now]
+                    set start [now]
+                    set actual [tm {*}$batch]
+                    record probe metadata batched_12 $start [now]
+                    check {$actual eq [string trimright [join $expected \n] \n]} "batched metadata differs"
+                    set start [now]
+                    exec $tmux -V
+                    record probe metadata local_version $start [now]
+                }
+                # Sanity-check observer overhead. No external process is launched
+                # between F7 and the popup prompt frame in these extra samples.
+                for {set sample 0} {$sample < 10} {incr sample} {
+                    tm set-option -g @aft_last_error BENCH_PENDING
+                    drain
+                    set frame ""
+                    set start [now]
+                    type "\033\[18~"
+                    set shown [wait_for {has_frame AFT_BENCH_PROMPT} "unpolled popup frame"]
+                    record probe warm unpolled_frame $start $shown
+                    check {[client_count] == 2} "unpolled popup did not attach"
+                    type "\033\[18~"
+                    wait_for {expr {[client_count] == 1}} "unpolled sample hide"
+                    wait_for {
+                        expr {[tm display-message -p -t $float {#{@aft_worker}|#{@aft_last_error}}] eq "|"}
+                    } "unpolled sample cleanup"
+                    after 20
+                }
+            }
+            # Cold means a new owned shell/session, not a flushed OS filesystem cache.
+            tm kill-session -t $float_session
+        }
+        tm kill-server
+        expect -i $client -timeout 15 eof {} timeout {error "private server did not exit"}
+        catch {close -i $client}
+        wait -i $client
+        set client ""
+        set frame ""
+        seek $trace 0 end
+    }
+    foreach key [lsort [dict keys $results]] { puts "MS $key [stats [dict get $results $key]]" }
+    foreach key [lsort [dict keys $counts]] { puts "COUNT $key [stats [dict get $counts $key]]" }
+    puts "MS observer/list-clients [stats $observer]"
+    puts "PASS: matching-client popup target, shell PID persistence, cold read response, no fixture input leakage"
+} message options]
+teardown
+if {$failed} {
+    puts stderr "BENCH FAILED: $message"
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+    exit 1
+}

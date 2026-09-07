@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing maintainer-created tag (v0.1.0 or v0.1.0-rc.1)
+        required: true
+        type: string
+      prerelease:
+        description: Mark the draft as a prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve existing tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate and resolve tag
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+          if [[ "$TAG" == *-* && "$PRERELEASE" != true ]]; then
+            printf '%s\n' 'Prerelease version tags must be marked prerelease.' >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$TAG"
+          commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify tagged source
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  build:
+    name: Package (${{ matrix.target }})
+    needs: [resolve, verify]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    env:
+      RUSTUP_TOOLCHAIN: 1.84.1
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Install Rust 1.84.1
+        run: rustup toolchain install 1.84.1 --profile minimal
+      - name: Package native binary
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/package-release.sh "$TAG" "$TARGET"
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/agent-float-term-${{ inputs.tag }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create draft release
+    needs: [resolve, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download this run's archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify assets and create draft
+        working-directory: dist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          archives=(
+            "agent-float-term-$TAG-aarch64-apple-darwin.tar.gz"
+            "agent-float-term-$TAG-x86_64-apple-darwin.tar.gz"
+            "agent-float-term-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for archive in "${archives[@]}"; do
+            test -s "$archive"
+          done
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            printf '%s\n' 'Release already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          # Reject a tag moved after the build, including annotated tags.
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG")
+          type=$(jq -r '.object.type' <<< "$ref")
+          sha=$(jq -r '.object.sha' <<< "$ref")
+          while [[ "$type" == tag ]]; do
+            ref=$(gh api "repos/$GH_REPO/git/tags/$sha")
+            type=$(jq -r '.object.type' <<< "$ref")
+            sha=$(jq -r '.object.sha' <<< "$ref")
+          done
+          test "$type" = commit
+          test "$sha" = "$COMMIT"
+          options=(--draft --verify-tag --target "$COMMIT" --title "$TAG" --generate-notes)
+          if [[ "$PRERELEASE" == true ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$TAG" "${archives[@]}" SHA256SUMS "${options[@]}"
