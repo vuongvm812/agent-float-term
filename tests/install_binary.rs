@@ -4,8 +4,24 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
+
+// A concurrent fork can inherit a copy's writable FD until exec closes it, even
+// with CLOEXEC. Linux then rejects executing that inode with ETXTBSY. Serialize
+// fixture copies against launches, not against arbitrary timing-based retries.
+static EXECUTABLE_IO: Mutex<()> = Mutex::new(());
+
+fn copy_payload(source: impl AsRef<Path>, destination: impl AsRef<Path>) {
+    let _guard = EXECUTABLE_IO
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    fs::copy(source, destination).unwrap();
+}
 
 fn invoke(binary: &Path, home: &Path, args: &[&str]) -> Output {
+    let _guard = EXECUTABLE_IO
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     Command::new(binary)
         .args(args)
         .env("HOME", home)
@@ -19,7 +35,9 @@ fn invoke(binary: &Path, home: &Path, args: &[&str]) -> Output {
         .env_remove("TMUX_PANE")
         .env_remove("AFT_TMUX_BINARY")
         .output()
-        .unwrap()
+        .unwrap_or_else(|error| {
+            panic!("cannot execute {} with {args:?}: {error}", binary.display())
+        })
 }
 
 fn success(output: Output) -> String {
@@ -50,7 +68,7 @@ impl BrewFixture {
         let prefix = home.join("brew");
         let keg = prefix.join("Cellar/agent-float-term/1/bin/agent-float-term");
         fs::create_dir_all(keg.parent().unwrap()).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_agent-float-term"), &keg).unwrap();
+        copy_payload(env!("CARGO_BIN_EXE_agent-float-term"), &keg);
         fs::set_permissions(&keg, fs::Permissions::from_mode(0o755)).unwrap();
         fs::create_dir_all(prefix.join("opt")).unwrap();
         fs::create_dir_all(prefix.join("bin")).unwrap();
@@ -198,7 +216,7 @@ fn homebrew_first_use_preserves_existing_modes_paths_and_roots() {
             "cargo" => {
                 let cargo = f.home.join(".cargo/bin/agent-float-term");
                 fs::create_dir_all(cargo.parent().unwrap()).unwrap();
-                fs::copy(source, &cargo).unwrap();
+                copy_payload(source, &cargo);
                 success(invoke(
                     &cargo,
                     &f.home,
@@ -264,7 +282,7 @@ fn homebrew_first_use_rejects_unsafe_or_mismatched_package_and_state() {
             "opt" => {
                 let other = f.home.join("brew/Cellar/agent-float-term/2/bin");
                 fs::create_dir_all(&other).unwrap();
-                fs::copy(&f.keg, other.join("agent-float-term")).unwrap();
+                copy_payload(&f.keg, other.join("agent-float-term"));
                 let opt = f.home.join("brew/opt/agent-float-term");
                 fs::remove_file(&opt).unwrap();
                 std::os::unix::fs::symlink("../Cellar/agent-float-term/2", &opt).unwrap();
@@ -310,7 +328,7 @@ fn generic_package_roots_do_not_autoregister_on_bind() {
         let f = BrewFixture::new();
         let binary = f.home.join(root).join("bin/agent-float-term");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        fs::copy(&f.keg, &binary).unwrap();
+        copy_payload(&f.keg, &binary);
         success(f.bind(&binary));
         assert!(!f.home.join("state/agent-float-term/install.json").exists());
         assert!(!f.home.join("data").exists());
@@ -349,7 +367,7 @@ fn actual_payload_install_update_rollback_and_uninstall() {
     // An unchanged, signed system executable supplies a second harmless payload.
     // Appending bytes to a Mach-O fixture would invalidate its signature on ARM64.
     let update = home.join("alternate-payload");
-    fs::copy("/usr/bin/true", &update).unwrap();
+    copy_payload("/usr/bin/true", &update);
     let hash = format!("{:x}", Sha256::digest(fs::read(&update).unwrap()));
     let update_path = update.to_str().unwrap();
     let rejected = invoke(
@@ -466,7 +484,7 @@ fn native_package_default_and_custom_cargo_roots_preserve_bytes_and_mode() {
         let binary = Path::new(env!("CARGO_BIN_EXE_agent-float-term"));
         let package_bin = home.join(root).join("bin/agent-float-term");
         fs::create_dir_all(package_bin.parent().unwrap()).unwrap();
-        fs::copy(binary, &package_bin).unwrap();
+        copy_payload(binary, &package_bin);
         fs::set_permissions(&package_bin, fs::Permissions::from_mode(0o755)).unwrap();
         let original = fs::read(&package_bin).unwrap();
         let data = home.join("data/agent-float-term");
@@ -556,4 +574,25 @@ fn native_package_default_and_custom_cargo_roots_preserve_bytes_and_mode() {
             .is_symlink());
         success(invoke(&package_bin, home, &["--version"]));
     }
+}
+
+#[test]
+fn parallel_fixture_copies_and_execs_are_safe() {
+    let start = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let temp = tempfile::tempdir().unwrap();
+                let binary = temp.path().join("agent-float-term");
+                start.wait();
+                for _ in 0..16 {
+                    copy_payload(env!("CARGO_BIN_EXE_agent-float-term"), &binary);
+                    assert_eq!(
+                        success(invoke(&binary, temp.path(), &["--version"])).trim(),
+                        format!("agent-float-term {}", env!("CARGO_PKG_VERSION"))
+                    );
+                }
+            });
+        }
+    });
 }
