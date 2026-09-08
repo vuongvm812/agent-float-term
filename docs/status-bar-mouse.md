@@ -96,7 +96,12 @@ shell retention/restoration, explicit hiding, AI-exit cleanup, and unchanged use
 tables. Unopted-in raw popups and negative mouse cases remain modal. The application
 reports no popup error for the intentional mouse dismissal.
 
-CI includes stock/patched checks in the Linux 3.7c reference lane. That remote
-execution and deployment with the user's actual status-bar plugins remain pending.
+CI includes stock/patched checks in the Linux 3.7c reference lane. Its first run
+exposed shortened patch hunks rejected by GNU patch with zero fuzz. The corrected
+patch uses balanced context; offline regressions run with both GNU and macOS patch
+tools, and failed builds now print the last 80 log lines while retaining the full
+log. A non-root Debian 12 ARM64 build, patched mouse suite, and keyboard/Neovim
+suite passed locally after the correction. Remote validation of the fix and
+deployment with the user's actual status-bar plugins remain pending.
 The earlier [native-pane experiment](native-pane-prototype.md) is still disabled;
 this solution retains client-local popups and existing keyboard routing instead.

@@ -366,7 +366,8 @@ set failed [catch {
     eventually {expr {[catch {exec kill -0 $float_pid 2>@1}]}} "retained shell process exits"
     check {[tm list-panes -a -F {#{pane_pid}}] eq $main_pids} "AI cleanup replaced main shells or leaked a pane"
     check {[client_session $observer] eq "alpha"} "observer moved during lifecycle checks"
-    check {[bindings] eq $baseline} "AI cleanup failed to restore original user tables"
+    # The watcher removes its restore key after terminating the retained shell.
+    eventually {expr {[bindings] eq $baseline}} "AI cleanup restores original user tables"
     puts "PASS explicit hide suppresses return; AI exit cleans shell and owned restore key; no popup error"
 } message options]
 if {$failed && $socket ne "" && [file exists $socket]} {

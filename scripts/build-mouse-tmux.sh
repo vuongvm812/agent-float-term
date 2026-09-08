@@ -65,7 +65,14 @@ fi
 umask 077
 mkdir -m 0700 -- "$build"
 printf 'Building patched tmux; full log: %s/build.log\n' "$build" >&2
-trap 'printf "Build failed; retained files and log: %s\n" "$build" >&2' ERR
+report_failure() {
+  local status=$?
+  printf 'Build failed (exit %s); retained files and log: %s\n' "$status" "$build" >&2
+  # Preserve quiet successful builds, but expose the useful end of failures in CI.
+  tail -n 80 "$build/build.log" >&2 || true
+  exit "$status"
+}
+trap report_failure ERR
 (
   archive="$build/tmux-$version.tar.gz"
   if [[ -n $local_archive ]]; then

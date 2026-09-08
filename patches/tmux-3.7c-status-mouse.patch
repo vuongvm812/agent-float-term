@@ -1,13 +1,17 @@
 --- a/cmd-display-menu.c
 +++ b/cmd-display-menu.c
-@@ -57,2 +57,2 @@
+@@ -54,8 +54,8 @@
+ 	.name = "display-popup",
+ 	.alias = "popup",
+ 
 -	.args = { "Bb:Cc:d:e:Eh:kNs:S:t:T:w:x:y:", 0, -1, NULL },
 -	.usage = "[-BCEkN] [-b border-lines] [-c target-client] "
 +	.args = { "Bb:Cc:d:e:Eh:kMNs:S:t:T:w:x:y:", 0, -1, NULL },
 +	.usage = "[-BCEkMN] [-b border-lines] [-c target-client] "
-@@ -501,6 +501,11 @@
- 	if (args_has(args, 'k')) {
- 		if (flags == -1)
+ 		 "[-d start-directory] [-e environment] [-h height] "
+ 		 "[-s style] [-S border-style] " CMD_TARGET_PANE_USAGE
+ 		 " [-T title] [-w width] [-x position] [-y position] "
+@@ -503,6 +503,11 @@
  			flags = 0;
  		flags |= POPUP_CLOSEANYKEY;
  	}
@@ -17,29 +21,43 @@
 +		flags |= POPUP_STATUSMOUSE;
 +	}
  
+ 	if (modify) {
+ 		popup_modify(tc, title, style, border_style, lines, flags);
 --- a/tmux.h
 +++ b/tmux.h
-@@ -3807,3 +3807,4 @@
+@@ -3806,6 +3806,7 @@
+ #define POPUP_INTERNAL 0x4
  #define POPUP_CLOSEANYKEY 0x8
  #define POPUP_NOJOB 0x10
 +#define POPUP_STATUSMOUSE 0x20
  typedef void (*popup_close_cb)(int, void *);
+ typedef void (*popup_finish_edit_cb)(char *, size_t, void *);
+ int		 popup_display(int, enum box_lines, struct cmdq_item *, u_int,
 --- a/format.c
 +++ b/format.c
-@@ -5893,3 +5893,6 @@
+@@ -5892,6 +5892,9 @@
+ {
  	struct paste_buffer	*pb;
  
 +	/* Versioned capability for the opt-in display-popup -M extension. */
 +	format_add(ft, "aft_popup_status_mouse", "%d", 1);
 +
  	if (c != NULL && c->name != NULL)
+ 		log_debug("%s: c=%s", __func__, c->name);
+ 	else
 --- a/popup.c
 +++ b/popup.c
-@@ -567,2 +567,3 @@
+@@ -565,6 +565,7 @@
+ 	const char		*buf;
+ 	size_t			 len;
  	u_int			 px, py, x;
 +	int			 statusat;
  	enum { NONE, LEFT, RIGHT, TOP, BOTTOM } border = NONE;
-@@ -590,4 +591,21 @@
+ 
+ 	if (pd->md != NULL) {
+@@ -588,6 +589,23 @@
+ 		    m->x > pd->px + pd->sx - 1 ||
+ 		    m->y < pd->py ||
  		    m->y > pd->py + pd->sy - 1) {
 +			statusat = status_at_line(c);
 +			if ((pd->flags & POPUP_STATUSMOUSE) &&

@@ -29,6 +29,7 @@ cargo +1.84.1 build --locked --release
 expect tests/external_smoke.exp target/release/agent-float-term
 python3 -B -m unittest discover -s scripts -p 'test_release*.py'
 python3 -B -m unittest discover -s scripts -p 'test_install_local.py'
+python3 -B -m unittest discover -s scripts -p 'test_tmux_patch.py'
 ruby scripts/test-homebrew-formula.rb target/release/agent-float-term
 # In a clean checkout of the source intended for packaging:
 bash scripts/verify-cargo-package.sh

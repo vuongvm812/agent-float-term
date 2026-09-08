@@ -5,6 +5,10 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+- Fix strict GNU patch application of the tmux status-mouse extension by using
+  balanced unified-diff context. Expose build failures in CI output, add offline
+  patch/logging regressions, and wait for asynchronous mouse-test binding cleanup.
+
 ### Status-Bar Mouse Switching
 
 - Add `make install` to build/install the managed application and a separate

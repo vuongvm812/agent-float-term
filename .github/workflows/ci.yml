@@ -87,6 +87,8 @@ jobs:
         run: python3 -B -m unittest discover -s scripts -p 'test_release*.py' -v
       - name: Local install orchestration tests (no live installation)
         run: python3 -B -m unittest discover -s scripts -p 'test_install_local.py' -v
+      - name: Tmux patch portability and build diagnostics
+        run: python3 -B -m unittest discover -s scripts -p 'test_tmux_patch.py' -v
       - name: Clippy
         run: cargo +1.84.1 clippy --locked --all-targets -- -D warnings
       - name: Tests
