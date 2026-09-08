@@ -721,8 +721,12 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn helper_path() -> Result<PathBuf> {
+    let paths = Paths::discover()?;
+    if let Some(external) = crate::install::external_helper_path(&paths)? {
+        return Ok(external);
+    }
     let executable = env::current_exe()?.canonicalize()?;
-    let installed = Paths::discover()?.bin.join("agent-float-term");
+    let installed = paths.bin.join("agent-float-term");
     if installed
         .canonicalize()
         .is_ok_and(|path| path == executable)

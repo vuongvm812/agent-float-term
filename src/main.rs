@@ -15,6 +15,9 @@ struct Cli {
 enum Command {
     /// Preview a user-local install; apply only with --yes
     Install {
+        /// Integration-only install; the package manager owns this stable executable
+        #[arg(long, value_name = "ABSOLUTE_STABLE_PATH")]
+        external_binary: Option<PathBuf>,
         /// Explicitly opt into editing this tmux configuration
         #[arg(long, value_name = "PATH")]
         tmux_config: Option<PathBuf>,
@@ -102,11 +105,13 @@ enum Command {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Install {
+            external_binary,
             tmux_config,
             shell_config,
             shell_kind,
             yes,
         } => install::install(install::InstallOptions {
+            external_binary,
             tmux_config,
             shell_config,
             shell_kind,
@@ -180,12 +185,27 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["aft", "install"]).unwrap().command,
             Command::Install {
+                external_binary: None,
                 tmux_config: None,
                 shell_config: None,
                 shell_kind: None,
                 yes: false,
             }
         ));
+        assert!(Cli::try_parse_from(["aft", "install", "--external-binary"]).is_err());
+        assert!(
+            Cli::try_parse_from(["aft", "install", "--external-binary", "/stable/bin/aft"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "aft",
+            "install",
+            "--external-binary",
+            "/one",
+            "--external-binary",
+            "/two"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["aft", "install", "--integration-only"]).is_err());
     }
 
     #[test]

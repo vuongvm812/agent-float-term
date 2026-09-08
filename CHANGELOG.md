@@ -5,6 +5,22 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+### Homebrew And Cargo Release Preparation
+
+- Add `install --external-binary PATH` for native package-manager ownership.
+  Register integrations without copying or modifying the supplied executable;
+  retain stable Homebrew/Cargo paths across upgrades and old-keg removal.
+- Manifest format 3 records external registration; existing managed formats 1/2
+  remain supported. External update/rollback require the package manager;
+  uninstall removes only owned integrations and preserves the package binary.
+- Prepare a checksum-derived custom-tap formula and manually dispatched crates.io
+  verification/Trusted Publishing workflow. Stable GitHub drafts include the
+  generated formula; no tap commits or stable publication happen automatically.
+- Add crate-content verification, package-path permissions/ownership regressions,
+  and isolated upgrade coverage for unchanged bindings and running watchers.
+- Separate Homebrew, Cargo, release archive, and Git source instructions. Cargo
+  still compiles locally; publication of all distribution channels remains pending.
+
 ### Generated Integration Layout
 
 - Store generated shell/tmux scripts under the XDG data directory instead of the
@@ -12,8 +28,8 @@ evidence that the implementation or compatibility testing is complete.
 - Plain reinstall migrates intact legacy scripts and exact previously managed
   startup references transactionally. Preserve unrelated startup bytes, modes,
   and user settings; refuse edited, missing, or unowned migration targets.
-- Manifest format 2 records the new layout. Current management commands read
-  formats 1 and 2; binary rollback does not reverse the filesystem migration.
+- Manifest format 2 records the managed layout. Management commands retain support
+  for formats 1 and 2; binary rollback does not reverse the filesystem migration.
 
 ### JSON Configuration And Runtime Contract
 

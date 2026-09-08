@@ -8,7 +8,8 @@ bugs and focused feature proposals. For vulnerabilities, follow
 
 Build with Rust **1.84.1**, edition **2021**. Runtime and PTY tests require
 **tmux 3.4+**; tests also require **Expect**, a C compiler (`cc`), **bash**, and
-**zsh**. Linux tests need procps, including an external `/bin/kill`, not just a
+**zsh**. Packaging checks also use **Python 3.9+** and **Ruby**. Linux tests need
+procps, including an external `/bin/kill`, not just a
 shell builtin. Install these dependencies in your chosen development or
 disposable test environment. CI installs them on its own runners. Do not change
 a developer's real tmux or shell configuration to run tests.
@@ -25,10 +26,15 @@ expect tests/startup_smoke.exp target/debug/agent-float-term
 expect tests/autostart_smoke.exp target/debug/agent-float-term
 expect tests/theme_smoke.exp target/debug/agent-float-term
 cargo +1.84.1 build --locked --release
+expect tests/external_smoke.exp target/release/agent-float-term
+python3 -B scripts/test_release_helpers.py
+ruby scripts/test-homebrew-formula.rb target/release/agent-float-term
+# In a clean checkout of the source intended for packaging:
+bash scripts/verify-cargo-package.sh
 ```
 
 The binary project's `Cargo.lock` must be tracked and compatible with this pinned
-toolchain. Do not drop `--locked` to hide a lockfile problem. All four required smoke
+toolchain. Do not drop `--locked` to hide a lockfile problem. All five required smoke
 entry points and the lockfile are release prerequisites; CI intentionally fails
 rather than skips a missing prerequisite.
 
@@ -48,7 +54,7 @@ They must not attach to or kill an unrelated server, edit real startup files,
 or clean up user sessions. Cleanup traps should target only resources the test
 created. Keep fixture output synthetic; never record real prompts or secrets.
 
-All four required Expect entry points accept the binary as their first argument.
+All five required Expect entry points accept the binary as their first argument.
 Each test owns creation and teardown of its isolated environment and must fail
 on assertions or timeouts instead of silently skipping missing dependencies.
 CI gives each smoke step a separate five-minute timeout and
@@ -69,6 +75,14 @@ global/parent-style preservation, per-open owned pane/window resets, persistent
 identities, and linked-window refusal before mutation. It selects tmux via PATH
 and has passed on Linux 3.3a and macOS 3.5a/3.7c. This is not OS opacity or
 emulator screenshot coverage; see [theme limits](docs/operations.md#terminal-theme-and-opacity).
+
+`tests/external_smoke.exp` registers a real executable at a temporary Homebrew-style
+stable `opt` path, retargets it to a new keg, and removes the old keg while a
+watcher runs. It verifies unchanged root/restoration bindings, original watcher
+identity, preserved shell state, and safe uninstall. The fixture requires realistic
+0775 package directories: `admin` group on macOS, primary group on Linux. Run the
+macOS fixture as a user permitted to assign that group; do not silently downgrade
+the permission test to 0755. It uses no real Homebrew installation.
 
 Keep installer coverage for Bash's inline interactive/real-TTY guards, execution
 string **setness** (including empty `-ic`/`-lic`), Zsh script guards and bounded
@@ -109,7 +123,7 @@ Codex validation used a temporary-only official npm package with
 package. Do not infer that Codex remains installed, and do not install a global
 CLI merely to run this optional test.
 
-For local release acceptance, run all four required smoke entry points against
+For local release acceptance, run all five required smoke entry points against
 `target/release/agent-float-term` and again against the packaged executable.
 `tests/install_binary.rs` adds a separate actual-CLI installation/update/rollback/
 uninstall test to `cargo test --locked --all-targets`; its focused invocation is:

@@ -1,6 +1,6 @@
 # Compatibility And Validation
 
-**Current status: refactor implemented and locally PTY-tested on macOS.**
+**Current status: native-package release setup locally tested; publication pending.**
 The runtime minimum is **3.4**. Each float belongs to one AI invocation and is
 reset when it exits. Tmux keyboard shortcuts target the main terminal.
 Returning to the original AI pane restores a
@@ -15,9 +15,12 @@ remote matrix, or public-download acceptance.
 
 | Change | Evidence | Still Needed |
 | --- | --- | --- |
-| Configuration, installer, and Rust APIs | 75 macOS tests passed, including legacy-layout migration and seven config tests; Linux ARM64 test-target cross-check passed | Current Linux runtime and remote CI acceptance |
+| Configuration, installer, and Rust APIs | 85 macOS ARM64 tests and Clippy passed; 83 tests passed on non-root Debian 12 ARM64, Rust 1.84.1 | Linux x86_64 release and remote CI acceptance |
 | Generated integration layout | Fresh install, Bash/Zsh migration, no-write preview, idempotency, byte/mode preservation, collision/edited-file refusal, and migrated uninstall passed; all four release smoke suites passed | Broader Linux runtime migration coverage |
-| JSON-based smoke fixtures | Release-binary core PTY and theme suites passed on macOS tmux 3.4, 3.5a, and 3.7c; release startup/autostart passed on 3.7c | Current packaged-archive acceptance and updated latency benchmark |
+| JSON-based smoke fixtures | All five current release smoke suites passed on macOS tmux 3.7c, also against a freshly extracted native ARM64 archive; earlier core PTY/theme suites also passed on 3.4 and 3.5a | Intel/Linux x86_64 archive acceptance and updated latency benchmark |
+| Package-owned executable upgrades | External-upgrade PTY passed on macOS 3.7c (release/debug) and non-root Debian 12 ARM64 3.4 (debug); realistic 0775 package groups, removed old keg, original watcher and shell state, stable root/restore bindings | Real Homebrew upgrade acceptance and remaining native targets |
+| Cargo distribution | Upload file list inspected; publish dry-run built the unpacked crate and aborted upload as expected; actual Cargo install/uninstall from unpacked crate passed with isolated root and integration-only setup | Clean tagged-source remote gate and installation from published crates.io version |
+| Homebrew formula and release helpers | 14 fixture tests, actual Homebrew DSL loading, isolated formula integration test, Ruby syntax, actionlint, and ShellCheck passed | Full audit blocked locally by missing `rubocop-ast`; public formula URLs and real Brew install/test/upgrade/uninstall remain pending |
 | tmux 3.4 minimum | Enforced at runtime; core PTY suite passed on macOS 3.4, 3.5a, and 3.7c; CI minimum lane updated and archive hash verified | GitHub CI execution |
 | AI-invocation lifetime | Core PTY tests cover same-invocation state, fresh restart, visible/hidden termination, background-job cleanup, and stop/resume | Real authenticated AI exit scenarios; no daemonized-job containment claim |
 | Main shortcuts and restoration | Core PTY tests cover root, prefix, prefix2, rapid custom-table sequences, new main windows/sessions, return-to-origin restoration, prompt protection, explicit hide, and client contention | Broader terminal-emulator and arbitrary custom mouse/plugin behavior |
@@ -33,11 +36,22 @@ that heuristic; bracketed paste keeps native handling. Theme coverage now retain
 SGR state across checkpoints and handles empty SGR reset and DEC saved rendition,
 rather than assuming each captured chunk starts with default colors.
 
-The generated-script layout was also applied to the local installation: scripts
+The Linux package-mode tests used `rust:1.84.1-slim` (Debian 12 / aarch64), UID/GID
+65534, read-only source/registry mounts, and temporary build output. They include
+the external-upgrade debug PTY test, not a rerun of all four other Linux suites
+or Linux Clippy. The macOS publish dry run used `--allow-dirty` only to verify this
+uncommitted working tree; CI and real publication require a clean checkout.
+The current local ARM64 archive is under `target/tmp/release-acceptance/`; its
+four-entry layout was inspected and the extracted executable matched the built
+binary byte-for-byte before all five packaged smoke suites passed. This is not
+a published GitHub asset or acceptance of the other platform archives.
+
+The earlier generated-script layout was applied to the local installation: scripts
 now live under the data directory, the exact managed `.zshrc` reference was
 updated, and the config directory contains no generated files. Read-only doctor
 reported valid defaults and an intact binding; the existing tmux 3.5a server PID
-was unchanged. This is not an authenticated/model-interaction test.
+was unchanged. Native-package mode has not been applied to that installation.
+This is not an authenticated/model-interaction test.
 
 ## Historical Local Evidence
 

@@ -27,6 +27,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       commit: ${{ steps.tag.outputs.commit }}
+      tag_object: ${{ steps.tag.outputs.tag_object }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -39,14 +40,11 @@ jobs:
           TAG: ${{ inputs.tag }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]
+          python3 -B scripts/release_source.py resolve "$TAG" >> "$GITHUB_OUTPUT"
           if [[ "$TAG" == *-* && "$PRERELEASE" != true ]]; then
             printf '%s\n' 'Prerelease version tags must be marked prerelease.' >&2
             exit 1
           fi
-          git check-ref-format "refs/tags/$TAG"
-          commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
-          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   verify:
     name: Verify tagged source
@@ -85,6 +83,7 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
           TARGET: ${{ matrix.target }}
+          COPYFILE_DISABLE: '1' # Keep macOS AppleDouble metadata out of the tar layout.
         run: bash scripts/package-release.sh "$TAG" "$TARGET"
       - name: Upload archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -102,6 +101,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out exact verified release source and formula template
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
       - name: Download this run's archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -116,6 +120,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           archives=(
@@ -128,23 +133,20 @@ jobs:
           done
           sha256sum "${archives[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
+          assets=("${archives[@]}" SHA256SUMS)
+          if [[ "$PRERELEASE" == false ]]; then
+            python3 -B ../scripts/generate-homebrew-formula.py "$TAG" SHA256SUMS --output agent-float-term.rb
+            ruby -c agent-float-term.rb
+            assets+=(agent-float-term.rb)
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             printf '%s\n' 'Release already exists; refusing to overwrite it.' >&2
             exit 1
           fi
-          # Reject a tag moved after the build, including annotated tags.
-          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG")
-          type=$(jq -r '.object.type' <<< "$ref")
-          sha=$(jq -r '.object.sha' <<< "$ref")
-          while [[ "$type" == tag ]]; do
-            ref=$(gh api "repos/$GH_REPO/git/tags/$sha")
-            type=$(jq -r '.object.type' <<< "$ref")
-            sha=$(jq -r '.object.sha' <<< "$ref")
-          done
-          test "$type" = commit
-          test "$sha" = "$COMMIT"
+          # Check both the original tag object and its peeled commit immediately before upload.
+          python3 -B ../scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
           options=(--draft --verify-tag --target "$COMMIT" --title "$TAG" --generate-notes)
           if [[ "$PRERELEASE" == true ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$TAG" "${archives[@]}" SHA256SUMS "${options[@]}"
+          gh release create "$TAG" "${assets[@]}" "${options[@]}"

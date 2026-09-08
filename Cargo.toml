@@ -6,8 +6,11 @@ rust-version = "1.84"
 description = "Harness Floating Terminal: a persistent F7 shell for unwrapped AI CLIs"
 license = "MIT"
 repository = "https://github.com/vuongvm812/agent-float-term"
+homepage = "https://github.com/vuongvm812/agent-float-term"
+categories = ["command-line-utilities"]
+keywords = ["terminal", "tmux", "cli", "shell"]
 readme = "README.md"
-exclude = [".codegraph/", ".github/", "target/"]
+exclude = [".codegraph/", ".github/", "target/", "dist/", "**/__pycache__/"]
 
 [dependencies]
 anyhow = "=1.0.95"

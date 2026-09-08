@@ -83,12 +83,16 @@ jobs:
           test "$host" = "$EXPECTED_TARGET"
       - name: Formatting
         run: cargo +1.84.1 fmt --all -- --check
+      - name: Release helper tests (including generated Ruby syntax)
+        run: python3 -B -m unittest discover -s scripts -p 'test_release_helpers.py' -v
       - name: Clippy
         run: cargo +1.84.1 clippy --locked --all-targets -- -D warnings
       - name: Tests
         run: cargo +1.84.1 test --locked --all-targets
       - name: Debug build
         run: cargo +1.84.1 build --locked
+      - name: Isolated Homebrew formula integration test (no brew installation)
+        run: ruby scripts/test-homebrew-formula.rb target/debug/agent-float-term
       - name: Isolated PTY smoke test
         timeout-minutes: 5
         env:
@@ -111,3 +115,10 @@ jobs:
         run: expect tests/theme_smoke.exp target/debug/agent-float-term
       - name: Release build
         run: cargo +1.84.1 build --locked --release
+      - name: Isolated package-managed upgrade smoke test
+        timeout-minutes: 5
+        env:
+          TERM: xterm-256color
+        run: expect tests/external_smoke.exp target/release/agent-float-term
+      - name: Inspect and verify crates.io package
+        run: bash scripts/verify-cargo-package.sh

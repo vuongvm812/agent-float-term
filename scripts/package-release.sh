@@ -9,7 +9,7 @@ fi
 tag=$1
 target=$2
 output=${3:-dist}
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || {
   printf '%s\n' 'Expected a version tag beginning with v.' >&2
   exit 2
 }

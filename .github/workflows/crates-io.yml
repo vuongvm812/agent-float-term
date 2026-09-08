@@ -1,0 +1,145 @@
+name: Crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version-matching tag (v0.1.0 or v0.1.0-rc.1)
+        required: true
+        type: string
+      dry_run:
+        description: Verify only; do not request credentials or publish
+        required: true
+        default: true
+        type: boolean
+      confirmation:
+        description: To publish, disable dry_run and enter 'publish TAG' (for example publish v0.1.0)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: 1.84.1
+
+jobs:
+  resolve:
+    name: Resolve existing tag and publish intent
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+      tag_object: ${{ steps.tag.outputs.tag_object }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate intent and resolve source
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [[ "$DRY_RUN" != true && "$CONFIRMATION" != "publish $TAG" ]]; then
+            printf '%s\n' 'Publication requires explicit publish TAG confirmation.' >&2
+            exit 1
+          fi
+          python3 -B scripts/release_source.py resolve "$TAG" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify tagged source
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.commit }}
+
+  dry-run:
+    name: Clean crates.io dry run
+    needs: [resolve, verify]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Install Rust 1.84.1
+        run: rustup toolchain install 1.84.1 --profile minimal
+      - name: Inspect package and verify clean upload
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          test -z "$(git status --porcelain)"
+          actual=$(cargo +1.84.1 metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "agent-float-term"))')
+          test "$actual" = "$VERSION"
+          bash scripts/verify-cargo-package.sh
+          cargo +1.84.1 publish --locked --dry-run
+      - name: Recheck immutable tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
+        run: python3 -B scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
+
+  publish:
+    name: Publish verified tag with short-lived credentials
+    if: ${{ !inputs.dry_run && inputs.confirmation == format('publish {0}', inputs.tag) }}
+    needs: [resolve, dry-run]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    # Maintainers must configure required reviewers on this environment and a matching
+    # crates.io trusted publisher. The first-ever crate publish needs a manual API token;
+    # this workflow intentionally has no repository-token fallback.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Install Rust 1.84.1
+        run: rustup toolchain install 1.84.1 --profile minimal
+      - name: Recheck clean package after environment approval
+        shell: bash
+        run: |
+          test -z "$(git status --porcelain)"
+          cargo +1.84.1 publish --locked --dry-run
+      - name: Recheck tag before requesting credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
+        run: python3 -B scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
+      - name: Authenticate with crates.io trusted publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1; GitHub-verified commit
+      - name: Recheck tag and publish
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
+        run: |
+          python3 -B scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
+          cargo +1.84.1 publish --locked

@@ -5,7 +5,58 @@ your AI CLI. Run your AI command normally in a tmux pane.
 
 ## Installation
 
-Install tmux separately, then build from source with Rust 1.84.1:
+Requires **tmux 3.4+** and macOS or Linux. Install your AI CLI normally.
+Homebrew supplies tmux; other methods require you to install it separately.
+
+**Publication pending:** Homebrew, crates.io, and release archives are prepared
+but not published yet. Use a Git source build until the respective channel is
+available. Choose one method; switching an existing installation requires the
+[migration steps](docs/operations.md#switching-installation-methods).
+
+### Homebrew
+
+After the stable release and tap formula are published:
+
+```sh
+brew install vuongvm812/tap/agent-float-term
+aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
+"$aft" install --external-binary "$aft"
+# Review the preview before applying:
+"$aft" install --external-binary "$aft" --yes
+```
+
+Homebrew installs a release binary. Integration setup does not copy it elsewhere;
+`brew upgrade` owns binary updates. See [platform limits](docs/installation.md#homebrew).
+
+### Cargo
+
+After the crate is published, using the default Cargo installation root:
+
+```sh
+cargo install agent-float-term --locked
+aft="${CARGO_HOME:-$HOME/.cargo}/bin/agent-float-term"
+"$aft" install --external-binary "$aft"
+# Review the preview before applying:
+"$aft" install --external-binary "$aft" --yes
+```
+
+**Cargo compiles locally:** Rust/Cargo and a native build toolchain are required.
+Rust 1.84.1 is the release toolchain. Cargo owns the executable and updates;
+see [custom installation roots](docs/installation.md#cargo) if your Cargo settings
+override the default.
+
+### Release Archives
+
+After publication, download the archive for your OS/architecture from
+[GitHub Releases](https://github.com/vuongvm812/agent-float-term/releases), verify
+its entry in `SHA256SUMS`, then run the extracted binary's `install` preview and
+repeat with `--yes`. No Rust compiler is needed.
+
+Follow the [download and verification commands](docs/installation.md#release-archives).
+The installer owns a local copy at `~/.local/bin/agent-float-term`; do not copy a
+regular executable to that destination before running the installer.
+
+### Build From Source
 
 ```sh
 git clone https://github.com/vuongvm812/agent-float-term.git
@@ -17,6 +68,10 @@ cargo +1.84.1 build --locked --release
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### Activate
+
+Ensure the selected binary directory is on `PATH`: Homebrew's `bin`, Cargo's
+installation-root `bin`, or `~/.local/bin` for managed archive/source installs.
 Inside your existing tmux server:
 
 ```sh
@@ -76,4 +131,5 @@ See the [validation matrix](docs/compatibility.md) for platform coverage and tes
 limits. This tool adds no telemetry or prompt logging; tmux is not a sandbox.
 
 [Contributing](CONTRIBUTING.md) | [Changelog](CHANGELOG.md) |
-[Release checklist](docs/release-checklist.md) | [MIT license](LICENSE)
+[Publishing](docs/publishing.md) | [Release checklist](docs/release-checklist.md) |
+[MIT license](LICENSE)

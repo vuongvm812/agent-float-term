@@ -11,14 +11,14 @@ tmux 3.4, 3.5a, and 3.7c; see the current validation table for remaining limits.
 
 | Command | Purpose |
 | --- | --- |
-| `install [--tmux-config PATH] [--shell-config PATH --shell-kind bash\|zsh] [--yes]` | Preview installation; apply with `--yes`. Each startup file requires its own opt-in flag. |
+| `install [--external-binary PATH] [--tmux-config PATH] [--shell-config PATH --shell-kind bash\|zsh] [--yes]` | Preview installation; apply with `--yes`. External mode registers integrations without owning the executable. Each startup file requires its own opt-in flag. |
 | `bind [--socket PATH] [--replace-key]` | Integrate with an existing server; foreign-key replacement requires opt-in. |
 | `start` | Open a dedicated normal shell, or initialize/bind the existing server when inside tmux. |
 | `doctor [--socket PATH]` | Read-only dependency, JSON config, and selected-server diagnosis. |
 | `sessions [--socket PATH]` | Inspect owned floats, including retained orphans. |
 | `cleanup [--socket PATH] [--session NAME] [--yes]` | Preview or explicitly remove eligible owned orphans. |
-| `update --from PATH --sha256 HASH` | Binary-only local SHA-256-verified update, not a template refresh. |
-| `rollback` | Restore the retained previous binary, if available. |
+| `update --from PATH --sha256 HASH` | Managed installs only: binary-only local SHA-256-verified update, not a template refresh. |
+| `rollback` | Managed installs only: restore the retained previous binary, if available. |
 | `uninstall [--yes]` | Preview or explicitly remove managed installation state. |
 
 See [JSON configuration](configuration.md) for `shortcut`, dimensions, and
@@ -26,7 +26,7 @@ advanced executable paths. Use the same socket consistently across commands.
 
 ## Managed Installation
 
-Run `install` directly from the extracted release binary or from
+For archive/source installation, run `install` directly from the extracted release binary or from
 `./target/release/agent-float-term`, review the preview, then repeat with `--yes`.
 The installer creates a digest-addressed payload and an owned symlink at
 `$HOME/.local/bin/agent-float-term`. Do not prepopulate that destination with a
@@ -51,6 +51,83 @@ and file permissions are preserved. Intact legacy scripts are removed from the
 config directory in the same recoverable transaction. Edited/missing scripts or
 blocks and occupied new destinations abort migration without overwriting them.
 The read-only preview lists these migration targets. `config.json` is untouched.
+
+## Package-Managed Installation
+
+Homebrew and Cargo retain ownership of their executable. Register it once with
+`install --external-binary /absolute/stable/path`, review the preview, and repeat
+with `--yes`. See the [Homebrew and Cargo examples](installation.md). This mode
+creates only owned integrations and private installation state, not a binary
+copy, `current` link, release directory, or `~/.local/bin` link.
+
+The supplied path must resolve to the binary running the registration. Use
+Homebrew's stable `opt` path or the actual Cargo installation-root `bin` path,
+not a versioned Cellar path or whichever old executable happens to be on PATH.
+Stable symlinks are retained in generated scripts and runtime helpers, so package
+replacement does not bake an old version into future helper commands.
+
+Paths must have trusted root/current-user ownership and non-writable-by-others
+ancestry. Group-write is allowed only on the verified same-prefix/same-formula
+Homebrew directory route: macOS trusts the administrative `admin` group, Linux
+the current user's primary group. Executables cannot be group/world-writable or
+setid. Application-state ancestry has no Homebrew exception. These are local
+path/permission checks, not proof of the package publisher's identity.
+
+Plain reinstall retains the external path and mode. `install --yes` can refresh
+owned templates without another `--external-binary` flag, but run it from the
+registered executable. A residual manifest with user-edited files stays inactive
+after uninstall; it cannot authorize runtime helpers or a silent mode switch.
+External registrations use manifest format 3. Older releases that do not support
+it cannot manage these integrations; use a supporting binary for cleanup.
+
+## Package Updates
+
+Use the same package manager and installation root that supplied the executable:
+
+```sh
+# Homebrew:
+brew upgrade vuongvm812/tap/agent-float-term
+
+# Cargo, default root (compiles locally):
+cargo install agent-float-term --locked
+# For a custom root, also repeat the original --root PATH.
+```
+
+The registered stable executable path follows those updates. No managed copy or
+integration reinstall is needed just to activate a new binary. Existing watcher
+processes may continue the old version until their owning invocation ends; an
+upgrade does not restart live jobs. If release notes require a template refresh,
+preview `install` from the new package executable and repeat with `--yes`.
+
+The app's `update` and `rollback` commands refuse external registrations. For
+Cargo, an explicit older `--version` with `--force` can reinstall a supported
+version; Homebrew downgrade availability depends on the tap. Neither operation
+reverses configuration/schema changes. Do not install a version lacking format-3
+support without first removing its integrations using a supporting version.
+App updates also do not solve a separately upgraded tmux client's compatibility
+with an older running server; see [tmux client selection](#tmux-client-selection).
+
+## Switching Installation Methods
+
+Changing managed/external ownership or an external path is deliberately not an
+in-place operation. Package-manager updates at the same stable path are not a
+method change.
+
+1. Finish or safely stop work in existing floats before switching. Do not kill
+   the tmux server or unrelated jobs.
+2. Run the old installation's `uninstall` preview, then `uninstall --yes`, while
+   its binary is still available to restore owned bindings. Inspect any preserved
+   edited files or unavailable-server warnings before proceeding. Residual
+   installation records require review; do not delete them blindly.
+3. Remove the old package with its package manager if desired. Managed uninstall
+   removes its own binary; external uninstall does not remove the package binary.
+4. Install and register the new method with the explicit paths in the installation
+   guide. Re-select any desired shell/tmux startup files, review, then apply.
+5. Confirm PATH selects the intended executable. Run `bind` and `doctor` in each
+   intended server. There is no need to restart tmux or replace its configuration.
+
+User `config.json` is preserved. If switching to Cargo with `--root ~/.local`,
+remove the previous managed installation before Cargo writes that destination.
 
 ## Existing Or Dedicated tmux
 
@@ -327,6 +404,9 @@ and their jobs. Do not use `tmux kill-server` as a cleanup shortcut.
 
 ## Local Update And Rollback
 
+This section applies to **managed archive/source installations**, not registered
+Homebrew/Cargo binaries. For those, use [package updates](#package-updates).
+
 Download a release archive yourself and verify its hash against the published
 `SHA256SUMS`. Extract only after verification, then calculate the **binary** hash:
 
@@ -387,7 +467,20 @@ agent-float-term uninstall
 agent-float-term uninstall --yes
 ```
 
-Managed uninstall is not permission to terminate arbitrary tmux sessions or
+For Homebrew/Cargo, run this integration cleanup **before** removing the package:
+
+```sh
+# Only after reviewing and applying integration uninstall above, choose one:
+brew uninstall vuongvm812/tap/agent-float-term
+cargo uninstall agent-float-term
+# Cargo custom roots must also use the original --root PATH.
+```
+
+External uninstall never deletes, chmods, or replaces the package executable.
+It can clean up a missing external package when invoked from another supporting
+binary with the same HOME/XDG roots. It does not require the old keg to exist.
+
+Uninstall is not permission to terminate arbitrary tmux sessions or
 remove user-authored config. Before uninstalling, inspect owned sessions with
 `sessions` and use explicit orphan cleanup only when safe. Follow the uninstall
 preview/output rather than deleting broad directories.
@@ -411,6 +504,9 @@ publication checks. Do not restart servers with live jobs just to clear bindings
 | Symptom | Checks |
 | --- | --- |
 | Installation refuses an unowned regular destination | Do not copy the binary into `~/.local/bin/agent-float-term` before installation. Inspect and relocate any existing file yourself if appropriate, then run the extracted/source binary's installer directly. |
+| Homebrew/Cargo install tries to create a managed binary copy | On first registration, use the package executable with `install --external-binary` and its absolute stable path. Existing managed installs need explicit migration first. |
+| External registration rejects a Cellar path or different source | Use Homebrew's `opt` path or the actual Cargo root, and invoke that same binary. Do not register from an older managed copy on PATH. |
+| External runtime rejects an unsafe or missing executable | Repair the package/path permissions using its package manager, or uninstall integrations with a supporting binary. Do not relax app state permissions to bypass the check. |
 | F7 never reaches the application | Check the terminal/OS key mapping, Fn mode, and tmux binding conflicts. |
 | F7 reaches the AI CLI rather than opening a float | Run `doctor`; confirm foreground eligibility, executable identity, and the selected server. Ambiguity intentionally forwards. |
 | An older shell integration left existing tmux without F7 | Refresh owned templates with the updated binary's `install --yes`, then run `bind` in the intended server. Older templates skipped `TMUX`; a binary-only `update` does not replace them. |

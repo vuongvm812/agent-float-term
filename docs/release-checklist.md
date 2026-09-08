@@ -11,6 +11,46 @@ no-model smoke coverage. See the
 [compatibility matrix](compatibility.md) for exact versions, counts, and limits.
 No commit, remote GitHub CI run, or release publication has been performed.
 
+## Package Release Preparation
+
+See [publishing](publishing.md) for the Homebrew tap handoff, initial crates.io
+API-token bootstrap, subsequent OIDC workflow, and exact approval steps. The
+following evidence is newer than the historical counts below. This work does
+not deploy the native-package mode to the user's live installation.
+
+- [x] Implement integration-only registration with stable package paths, retained
+  external reinstall mode, and package-preserving uninstall. Keep managed formats
+  1/2 and add format 3 for external registrations.
+- [x] macOS ARM64: 85 Rust tests and Clippy passed. Non-root Debian 12 ARM64:
+  83 Rust tests passed using Rust 1.84.1, UID/GID 65534, in a disposable container.
+- [x] Debug external-upgrade PTY acceptance on macOS tmux 3.7c and Linux tmux 3.4:
+  realistic 0775 package directories, old-keg removal, unchanged root/restore
+  commands, original watcher, shell-state preservation, cleanup, and managed
+  runtime with alternate XDG config/data roots.
+- [x] Rerun all five current release-binary smoke suites on macOS tmux 3.7c.
+  Verify the packaged crate via publish dry-run and actual isolated Cargo
+  install/integration/uninstall. Local `--allow-dirty` verifies working-tree
+  changes only; it is not clean tagged-source or registry installation acceptance.
+- [x] Package a fresh macOS ARM64 archive, inspect its four-entry layout, compare
+  the extracted binary byte-for-byte, and run all five smoke suites against it.
+  Local output is `target/tmp/release-acceptance/`, not a published release.
+- [x] Prepare version/tag validation, checksum/layout-derived stable formula,
+  isolated formula test, and crate content/build verification. Fourteen helper
+  tests, real Homebrew DSL loading, actionlint, ShellCheck, and Ruby syntax passed.
+- [x] Prepare dispatch-only crates.io workflow with dry-run default, exact publish
+  confirmation, protected-environment hook, and pinned short-lived OIDC auth.
+- [ ] Run clean remote CI including the new external-upgrade release smoke gate.
+- [ ] Complete real Homebrew audit/install/test/upgrade/uninstall on all supported
+  platforms. Local strict audit is blocked by missing `rubocop-ast`; no host
+  dependency was installed to bypass that blocker. DSL/shim checks are not audit.
+- [ ] Publish the reviewed stable archives and formula; hand off the formula to
+  `vuongvm812/homebrew-tap/Formula/agent-float-term.rb` and publish the tap change.
+- [ ] Complete initial crates.io publish manually, verify Cargo installation from
+  the registry, and configure both the `crates-io` required-reviewer environment
+  and matching crates.io Trusted Publisher for subsequent versions.
+- [ ] Only after channel publication/acceptance, replace the pending-availability
+  notices in README, installation guide, publishing guide, and tap README.
+
 ## Current Change Acceptance
 
 - [x] JSON-only configuration: seven focused config unit tests passed with Rust
@@ -167,7 +207,10 @@ directory containing only `agent-float-term`, `LICENSE`, and `README.md`. The
 optional output directory defaults to `dist`; existing packages are never overwritten.
 
 The publish job downloads only this run's three expected archives, generates
-`SHA256SUMS`, and creates a **draft** GitHub release for the existing tag. Only
+`SHA256SUMS`, and creates a **draft** GitHub release for the existing tag. Stable
+drafts also include `agent-float-term.rb`, rendered from the exact source/template
+and actual verified archive hashes. Prerelease drafts do not include a stable
+formula. The original tag object and peeled commit are rechecked before upload. Only
 that job receives `contents: write`; CI/build jobs have read-only repository
 permissions. Third-party action references are pinned to verified full SHAs.
 There is no signing, attestation, notarization, automatic source commit, or
@@ -187,6 +230,8 @@ substitute for installing and updating from each published platform archive.
 - [ ] Confirm tag and source commit match the reviewed source. Do not move tags.
 - [ ] Confirm all three archives and `SHA256SUMS` exist and names match
   [installation details](installation.md#release-archives).
+- [ ] For a stable draft, review the generated `agent-float-term.rb` asset against
+  the accepted archives and complete the [tap handoff](publishing.md#homebrew-tap).
 - [ ] Inspect archive contents: only binary, LICENSE, README; no `.codegraph/`,
   config, prompts, credentials, source checkout, or hidden local files.
 - [ ] Download each archive onto the corresponding platform, verify its archive

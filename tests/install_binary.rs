@@ -1,6 +1,7 @@
 //! Exercise the public installer against executable payloads, not only file fixtures.
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -11,6 +12,8 @@ fn invoke(binary: &Path, home: &Path, args: &[&str]) -> Output {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_RUNTIME_DIR", home.join("runtime"))
         .env("SHELL", "/bin/sh")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
@@ -164,4 +167,107 @@ fn actual_installer_migrates_legacy_layout_without_startup_flags() {
         fs::read_to_string(config.join("config.json")).unwrap(),
         "{\"height\":60}"
     );
+}
+
+#[test]
+fn native_package_default_and_custom_cargo_roots_preserve_bytes_and_mode() {
+    for root in [".cargo", ".local", "custom cargo root ' # \" $ [*]"] {
+        let temp = tempfile::Builder::new()
+            .prefix("aft native ")
+            .tempdir()
+            .unwrap();
+        let home = temp.path();
+        let binary = Path::new(env!("CARGO_BIN_EXE_agent-float-term"));
+        let package_bin = home.join(root).join("bin/agent-float-term");
+        fs::create_dir_all(package_bin.parent().unwrap()).unwrap();
+        fs::copy(binary, &package_bin).unwrap();
+        fs::set_permissions(&package_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = fs::read(&package_bin).unwrap();
+        let data = home.join("data/agent-float-term");
+        let manifest = home.join("state/agent-float-term/install.json");
+        let rc = home.join("selected shell ' rc");
+        fs::write(&rc, "# user setting without newline").unwrap();
+        let args = [
+            "install",
+            "--external-binary",
+            package_bin.to_str().unwrap(),
+            "--shell-config",
+            rc.to_str().unwrap(),
+            "--shell-kind",
+            "bash",
+        ];
+        let preview = success(invoke(&package_bin, home, &args));
+        assert!(preview.contains("integration-only"));
+        assert!(!home.join("state").exists());
+        assert!(!home.join("data").exists());
+        assert!(!home.join("config").exists());
+        assert_eq!(
+            fs::read_to_string(&rc).unwrap(),
+            "# user setting without newline"
+        );
+        // Identical bytes at a different path are not the executing package registration.
+        let rejected = invoke(binary, home, &args);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("running installation source"));
+        let mut apply = args.to_vec();
+        apply.push("--yes");
+        success(invoke(&package_bin, home, &apply));
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(value["format"], 3);
+        assert_eq!(value["external"]["path"], package_bin.to_str().unwrap());
+        assert_eq!(value["external"]["active"], true);
+        assert!(value["releases"].as_array().unwrap().is_empty());
+        assert!(value["current"].is_null() && value["previous"].is_null());
+        assert!(!data.join("releases").exists());
+        assert!(!data.join("current").exists());
+        if root != ".local" {
+            assert!(!home.join(".local/bin/agent-float-term").exists());
+        }
+        let template = fs::read_to_string(data.join("integration.sh")).unwrap();
+        assert!(template.contains(&agent_float_term::install::shell_quote(
+            package_bin.to_str().unwrap()
+        )));
+        success(invoke(
+            Path::new("/bin/bash"),
+            home,
+            &["-n", data.join("integration.sh").to_str().unwrap()],
+        ));
+        let before = fs::read(&manifest).unwrap();
+        success(invoke(&package_bin, home, &["install", "--yes"]));
+        assert_eq!(fs::read(&manifest).unwrap(), before);
+        for args in [
+            vec!["rollback"],
+            vec!["update", "--from", "/missing", "--sha256", "invalid"],
+        ] {
+            let output = invoke(&package_bin, home, &args);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("package manager"));
+            assert_eq!(fs::read(&manifest).unwrap(), before);
+        }
+        assert_eq!(fs::read(&package_bin).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&package_bin).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        success(invoke(&package_bin, home, &["uninstall"]));
+        assert_eq!(fs::read(&manifest).unwrap(), before);
+        success(invoke(&package_bin, home, &["uninstall", "--yes"]));
+        assert!(!manifest.exists());
+        assert!(!data.join("integration.sh").exists());
+        assert_eq!(
+            fs::read_to_string(&rc).unwrap(),
+            "# user setting without newline"
+        );
+        assert_eq!(fs::read(&package_bin).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&package_bin).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert!(!fs::symlink_metadata(&package_bin)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        success(invoke(&package_bin, home, &["--version"]));
+    }
 }

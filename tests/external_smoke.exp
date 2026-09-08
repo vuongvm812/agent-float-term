@@ -1,0 +1,210 @@
+#!/usr/bin/env expect
+# expect tests/external_smoke.exp /path/to/agent-float-term
+# Isolated native-package upgrade: real PTYs/tmux, inert harness, no live config/server.
+set timeout 15
+log_user 0
+if {$argc != 1} { puts stderr "usage: expect tests/external_smoke.exp /path/to/agent-float-term"; exit 1 }
+set source_binary [file normalize [lindex $argv 0]]
+set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
+foreach tool {tmux cc bash ps kill} {
+    if {[auto_execok $tool] eq ""} { puts stderr "external smoke requires $tool"; exit 1 }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok bash] 0]
+set root ""
+set socket ""
+set client ""
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} { global tmux socket; return [exec $tmux -S $socket {*}$args] }
+proc type {text} { global client; send -i $client -- $text }
+proc f7 {} { type "\033\[18~" }
+proc attached {count} { return [expr {[llength [split [tm list-clients -F {#{client_pid}}]]] == $count}] }
+proc contains {pane text} { return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}] }
+proc binding {table key} {
+    foreach line [split [tm list-keys -T $table] \n] {
+        if {[regexp {^bind-key +(?:-r +)?-T +[^ ]+ +([^ ]+) } $line ignored actual] && $actual eq $key} { return $line }
+    }
+    error "missing $table $key binding"
+}
+proc eventually {script message} {
+    global client
+    set deadline [expr {[clock milliseconds] + 15000}]
+    while {[clock milliseconds] < $deadline} {
+        if {$client ne ""} {
+            expect -i $client -timeout 0 -re {.+} {} timeout {} eof { error "tmux client exited" }
+        }
+        if {[uplevel 1 $script]} { return }
+        after 50
+    }
+    error "timed out: $message"
+}
+proc write_private {path contents} {
+    set out [open $path {WRONLY CREAT EXCL} 0600]
+    puts $out $contents
+    close $out
+}
+proc stable_command {command label} {
+    global binary prefix
+    check {[string first $binary $command] >= 0} "$label did not retain the stable opt path: $command"
+    check {[string first "$prefix/Cellar" $command] < 0} "$label pinned a versioned keg: $command"
+}
+proc teardown {} {
+    global root socket client tmux
+    if {$socket ne "" && [file exists $socket]} { catch {exec $tmux -S $socket kill-server} }
+    if {$client ne ""} { catch {close -i $client}; catch {wait -i $client} }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+set failed [catch {
+    set root [file normalize [exec mktemp -d /tmp/aft-external.XXXXXXXX]]
+    set inherited_path $env(PATH)
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) "$root/bin:$inherited_path"
+    foreach {name directory} {HOME home XDG_CONFIG_HOME config XDG_DATA_HOME data XDG_STATE_HOME state XDG_CACHE_HOME cache XDG_RUNTIME_DIR runtime TMUX_TMPDIR sockets} {
+        set env($name) [file join $root $directory]
+        file mkdir $env($name)
+        file attributes $env($name) -permissions 0700
+    }
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set env(PS1) {AFT_PROMPT> }
+    set env(PROMPT_COMMAND) ""
+    file mkdir $root/bin $env(XDG_CONFIG_HOME)/agent-float-term
+    file attributes $env(XDG_CONFIG_HOME)/agent-float-term -permissions 0700
+    set claude $root/bin/claude
+    exec cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
+    # JSON paths are escaped independently of shell/tmux syntax.
+    write_private $env(XDG_CONFIG_HOME)/agent-float-term/config.json [format {{"shell":"%s","harness_paths":[{"harness":"claude","path":"%s"}]}} \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $shell] \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $claude]]
+    set linux [expr {$tcl_platform(os) eq "Linux"}]
+    set prefix [expr {$linux ? "$root/home/linuxbrew/.linuxbrew" : "$root/brew"}]
+    set old $prefix/Cellar/agent-float-term/1
+    set new $prefix/Cellar/agent-float-term/2
+    foreach directory [list $prefix/opt $prefix/bin $old/bin $new/bin] { file mkdir $directory }
+    file attributes $prefix -permissions 0755
+    foreach keg [list $old $new] {
+        # Copy intact native images; modifying Mach-O bytes would invalidate signatures.
+        file copy $source_binary $keg/bin/agent-float-term
+        file attributes $keg/bin/agent-float-term -permissions 0755
+    }
+    set opt $prefix/opt/agent-float-term
+    file link -symbolic $opt ../Cellar/agent-float-term/1
+    file link -symbolic $prefix/bin/agent-float-term ../Cellar/agent-float-term/1/bin/agent-float-term
+    set binary $opt/bin/agent-float-term
+    # Homebrew uses :admin on macOS and `id -gn` on Linux. Never silently replace
+    # the 0775 acceptance case with 0755; missing group privileges are a test failure.
+    set package_mode 0775
+    set package_group [expr {$linux ? [string trim [exec id -gn]] : "admin"}]
+    set package_directories [list $prefix/opt $prefix/bin $prefix/Cellar $prefix/Cellar/agent-float-term $old $old/bin $new $new/bin]
+    if {$linux} { lappend package_directories $prefix }
+    foreach directory $package_directories {
+        file attributes $directory -group $package_group
+        file attributes $directory -permissions $package_mode
+    }
+    exec $binary install --external-binary $binary --yes
+    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/current]} "external install created current"
+    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/releases]} "external install created releases"
+    set socket $env(TMUX_TMPDIR)/server
+    tm -f /dev/null new-session -d -s outer -c $env(HOME) $shell --noprofile --norc -i
+    tm set-option -g default-shell $shell
+    tm set-option -g status off
+    tm set-option -g escape-time 100
+    tm bind-key -n F7 display-message AFT_ORIGINAL_BINDING
+    set original [binding root F7]
+    exec $binary bind --socket $socket --replace-key
+    set bound [binding root F7]
+    stable_command $bound "root binding"
+    set outer [tm display-message -p -t outer: {#{pane_id}}]
+    spawn -noecho $tmux -S $socket attach-session -t outer
+    set client $spawn_id
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {attached 1} "outer client attached"
+    type "claude\r"
+    eventually {contains $outer "AFT_READY claude"} "private native harness ready"
+    eventually {expr {[string first "Current pane: recognized interactive foreground harness" [exec env TMUX_PANE=$outer $binary doctor --socket $socket]] >= 0}} "foreground inspection ready"
+    f7
+    eventually {attached 2} "initial package opens float"
+    set float ""
+    foreach line [split [tm list-panes -a -F {#{pane_id}|#{@aft_owner}}] \n] {
+        lassign [split $line |] pane owner
+        if {$owner eq $outer} { check {$float eq ""} "duplicate float"; set float $pane }
+    }
+    check {$float ne ""} "float missing"
+    set float_session [tm display-message -p -t $float {#{session_id}}]
+    set float_pid [tm display-message -p -t $float {#{pane_pid}}]
+    set watcher [tm show-options -qv -t $float @aft_watcher]
+    check {[string is integer -strict $watcher]} "watcher PID missing"
+    exec kill -0 $watcher
+    set watcher_start [exec ps -p $watcher -o lstart=]
+    set restore_table [tm show-options -qv -t $float @aft_restore_table]
+    set restore_key [tm show-options -qv -t $float @aft_restore_key]
+    set restoration [binding $restore_table $restore_key]
+    stable_command $restoration "restoration command"
+    type "AFT_UPGRADE_VALUE=kept; printf 'AFT_FLOAT_%s\n' READY\r"
+    eventually {contains $float AFT_FLOAT_READY} "floating shell ready"
+
+    # Leave the original watcher running while replacing the package indirection.
+    file delete $opt
+    file link -symbolic $opt ../Cellar/agent-float-term/2
+    file delete $prefix/bin/agent-float-term
+    file link -symbolic $prefix/bin/agent-float-term ../Cellar/agent-float-term/2/bin/agent-float-term
+    file delete -force $old
+    check {![file exists $old]} "old Cellar survived upgrade"
+    exec $binary --version
+    check {[binding root F7] eq $bound} "upgrade rewrote root binding"
+    check {[binding $restore_table $restore_key] eq $restoration} "upgrade rewrote restoration command"
+
+    # Native prefix routing leaves the popup; the ORIGINAL watcher must restore it
+    # through the previously recorded stable command when returning to the main pane.
+    type "\002c"
+    eventually {attached 1} "prefix creates a main window after upgrade"
+    type "\002p"
+    eventually {attached 2} "old watcher restores through upgraded opt path"
+    check {[tm show-options -qv -t $float @aft_watcher] eq $watcher} "upgrade replaced watcher"
+    exec kill -0 $watcher
+    check {[exec ps -p $watcher -o lstart=] eq $watcher_start} "watcher PID was reused"
+    check {[tm display-message -p -t $float {#{pane_pid}}] eq $float_pid} "upgrade replaced floating shell"
+    type {printf 'AFT_PRESERVED_%s\n' "$AFT_UPGRADE_VALUE"}
+    type "\r"
+    eventually {contains $float AFT_PRESERVED_kept} "shell state survived package upgrade"
+    f7
+    eventually {attached 1} "F7 hides upgraded float"
+    f7
+    eventually {attached 2} "unchanged root binding reopens through upgraded opt path"
+    f7
+    eventually {attached 1} "hide before harness exit"
+    type q
+    eventually {catch {tm has-session -t $float_session}} "original watcher cleans up exited harness"
+    exec $binary uninstall --yes 2>@1
+    check {[binding root F7] eq $original} "uninstall did not restore private original binding"
+    check {[file exists $new/bin/agent-float-term]} "uninstall removed package executable"
+    # Managed runtime helpers must still work with alternate config/data roots and
+    # the original state root. Only the installer, not runtime fallback, pins those roots.
+    exec $source_binary install --yes 2>@1
+    set managed $env(HOME)/.local/bin/agent-float-term
+    set config_home $env(XDG_CONFIG_HOME)
+    set data_home $env(XDG_DATA_HOME)
+    set env(XDG_CONFIG_HOME) $root/alternate-config
+    set env(XDG_DATA_HOME) $root/alternate-data
+    exec $managed bind --socket $socket --replace-key
+    check {[string first $managed [binding root F7]] >= 0} "alternate XDG roots broke managed helper selection"
+    set env(XDG_CONFIG_HOME) $config_home
+    set env(XDG_DATA_HOME) $data_home
+    exec $managed uninstall --yes 2>@1
+    check {[binding root F7] eq $original} "managed uninstall did not restore original binding"
+    puts "PASS: external upgrade ([exec $tmux -V], package directories $package_mode :$package_group); stable root/restore commands, original watcher, shell state, cleanup, managed alternate XDG roots"
+} message options]
+if {$failed} {
+    puts stderr "FAIL: $message"
+    if {$socket ne "" && [file exists $socket]} {
+        catch {puts stderr [exec env TMUX_PANE=$outer $binary doctor --socket $socket 2>@1]}
+        catch {puts stderr [tm list-panes -a -F {#{pane_id}|#{session_name}|#{@aft_owner}|#{@aft_watcher}}]}
+        catch {puts stderr [tm capture-pane -p -t $outer]}
+    }
+    if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
+}
+teardown
+exit $failed

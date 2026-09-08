@@ -1,0 +1,111 @@
+# Generated from the exact release source and verified release archives. Review before publishing.
+class AgentFloatTerm < Formula
+  desc "Persistent F7 shell beside your unwrapped AI CLI"
+  homepage "https://github.com/vuongvm812/agent-float-term"
+  version "@VERSION@"
+  license "MIT"
+
+  depends_on "tmux"
+
+  on_macos do
+    on_arm do
+      depends_on macos: :sonoma
+      url "https://github.com/vuongvm812/agent-float-term/releases/download/@TAG@/agent-float-term-@TAG@-aarch64-apple-darwin.tar.gz"
+      sha256 "@AARCH64_APPLE_DARWIN_SHA256@"
+    end
+    on_intel do
+      depends_on macos: :sequoia
+      url "https://github.com/vuongvm812/agent-float-term/releases/download/@TAG@/agent-float-term-@TAG@-x86_64-apple-darwin.tar.gz"
+      sha256 "@X86_64_APPLE_DARWIN_SHA256@"
+    end
+  end
+
+  on_linux do
+    depends_on arch: :x86_64
+    url "https://github.com/vuongvm812/agent-float-term/releases/download/@TAG@/agent-float-term-@TAG@-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "@X86_64_UNKNOWN_LINUX_GNU_SHA256@"
+  end
+
+  def install
+    if OS.linux?
+      unless Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+        odie "Linux ARM64 is unsupported; only x86_64 GNU/Linux archives are provided."
+      end
+      libc = begin
+        Utils.safe_popen_read("/usr/bin/getconf", "GNU_LIBC_VERSION").strip
+      rescue ErrorDuringExecution
+        ""
+      end
+      unless libc.start_with?("glibc ") && Version.new(libc.split.last) >= Version.new("2.35")
+        odie "musl Linux is unsupported; this archive requires glibc 2.35 or newer."
+      end
+    end
+    bin.install "agent-float-term"
+  end
+
+  def caveats
+    <<~EOS
+      Homebrew owns the binary; this formula does not run the application's installer
+      or modify your shell/tmux configuration.
+      Preview optional user integration using the stable Homebrew path:
+        #{opt_bin}/agent-float-term install --external-binary "#{opt_bin}/agent-float-term"
+      Apply that integration-only plan by adding --yes. No binary is copied into your home.
+      Editing shell/tmux configuration requires explicit --shell-config/--tmux-config paths;
+      include the same options in the preview and the --yes command.
+
+      Preview integration removal with `agent-float-term uninstall`, then add --yes.
+      Remove integration before `brew uninstall agent-float-term`; Homebrew alone owns upgrades
+      and binary removal. The application's update/rollback commands are not used in this mode.
+    EOS
+  end
+
+  test do
+    home = testpath/"home"
+    home.mkpath
+    ENV["HOME"] = home.to_s
+    %w[CONFIG DATA STATE CACHE RUNTIME].each do |kind|
+      directory = home/"xdg-#{kind.downcase}"
+      directory.mkpath
+      ENV["XDG_#{kind}_HOME"] = directory.to_s unless kind == "RUNTIME"
+      ENV["XDG_RUNTIME_DIR"] = directory.to_s if kind == "RUNTIME"
+    end
+    ENV["XDG_CONFIG_DIRS"] = (home/"config-dirs").to_s
+    ENV["XDG_DATA_DIRS"] = (home/"data-dirs").to_s
+    ENV["SHELL"] = "/bin/bash"
+    ENV.delete("TMUX")
+    ENV.delete("TMUX_PANE")
+    ENV.delete("AFT_TMUX_BINARY")
+    binary = opt_bin/"agent-float-term"
+    original = Digest::SHA256.file(binary).hexdigest
+    tmux_config = home/"tmux.conf"
+    shell_config = home/"bashrc"
+    tmux_config.write "# original tmux config\n"
+    shell_config.write "# original shell config\n"
+    args = ["install", "--external-binary", binary.to_s,
+            "--tmux-config", tmux_config.to_s, "--shell-config", shell_config.to_s,
+            "--shell-kind", "bash"]
+    system binary, *args
+    refute_path_exists home/"xdg-state/agent-float-term/install.json"
+    assert_equal "# original tmux config\n", tmux_config.read
+    assert_equal "# original shell config\n", shell_config.read
+    system binary, *args, "--yes"
+    assert_path_exists home/"xdg-state/agent-float-term/install.json"
+    assert_match binary.to_s, (home/"xdg-data/agent-float-term/integration.tmux").read
+    assert_match "# BEGIN agent-float-term managed v1", tmux_config.read
+    assert_match "# BEGIN agent-float-term managed v1", shell_config.read
+    refute_path_exists home/".local/bin/agent-float-term"
+    refute_path_exists home/"xdg-data/agent-float-term/current"
+    refute_path_exists home/"xdg-data/agent-float-term/releases"
+    system binary, "uninstall"
+    assert_path_exists home/"xdg-state/agent-float-term/install.json"
+    system binary, "uninstall", "--yes"
+    refute_path_exists home/"xdg-state/agent-float-term/install.json"
+    refute_path_exists home/"xdg-data/agent-float-term/integration.tmux"
+    refute_path_exists home/"xdg-data/agent-float-term/integration.sh"
+    assert_equal "# original tmux config\n", tmux_config.read
+    assert_equal "# original shell config\n", shell_config.read
+    assert_path_exists binary
+    assert_equal original, Digest::SHA256.file(binary).hexdigest
+    system binary, "--version"
+  end
+end

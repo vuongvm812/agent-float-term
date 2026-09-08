@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const BEGIN: &str = "# BEGIN agent-float-term managed v1";
@@ -24,6 +25,8 @@ const BINARY: &str = "agent-float-term";
 
 #[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
+    /// Register integrations only; the package manager retains ownership of this stable path.
+    pub external_binary: Option<PathBuf>,
     /// Opt into editing this tmux configuration. None never selects a default user file.
     pub tmux_config: Option<PathBuf>,
     /// Independently opt into editing this shell configuration; does not imply tmux integration.
@@ -52,55 +55,86 @@ struct Manifest {
     releases: Vec<String>,
     files: Vec<OwnedText>,
     blocks: Vec<OwnedText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external: Option<External>,
 }
 
-fn manifest(paths: &Paths) -> Result<(Snapshot, Option<Manifest>)> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct External {
+    path: PathBuf,
+    active: bool,
+}
+
+fn read_manifest(paths: &Paths) -> Result<(Snapshot, Option<Manifest>)> {
     let before = snapshot(&paths.state.join("install.json"))?;
     let value = regular(&before)?
         .map(serde_json::from_slice::<Manifest>)
         .transpose()
         .context("invalid installation manifest")?;
+    Ok((before, value))
+}
+
+fn manifest(paths: &Paths) -> Result<(Snapshot, Option<Manifest>)> {
+    let (before, value) = read_manifest(paths)?;
     if let Some(value) = &value {
-        if !matches!(value.format, 1 | 2) || value.paths != *paths {
-            bail!("installation manifest version or directory roots do not match");
-        }
-        if !matches!(value.shell_kind.as_str(), "bash" | "zsh")
-            || value.releases.iter().any(|s| !valid_digest(s))
-            || value
-                .current
-                .iter()
-                .chain(value.previous.iter())
-                .any(|s| !value.releases.contains(s))
-            || value.files.len() > 2
-            || value.blocks.len() > 2
-        {
-            bail!("invalid installation manifest entries");
-        }
-        let root = if value.format == 1 {
-            &paths.config
-        } else {
-            &paths.data
-        };
-        let mut names = std::collections::HashSet::new();
-        for file in &value.files {
-            if (file.path != root.join("integration.tmux")
-                && file.path != root.join("integration.sh"))
-                || !names.insert(file.path.file_name())
-            {
-                bail!("manifest contains an unexpected owned file");
-            }
-        }
-        let mut kinds = std::collections::HashSet::new();
-        let mut targets = std::collections::HashSet::new();
-        for block in &value.blocks {
-            user_target(paths, &block.path)?;
-            block_range(block.text.as_bytes(), &block.text)?;
-            if !kinds.insert(block_kind(block)?) || !targets.insert(&block.path) {
-                bail!("manifest contains duplicate integration kinds or targets");
-            }
-        }
+        validate_manifest(paths, value)?;
     }
     Ok((before, value))
+}
+
+fn validate_manifest(paths: &Paths, value: &Manifest) -> Result<()> {
+    if !matches!(value.format, 1..=3) || value.paths != *paths {
+        bail!("installation manifest version or directory roots do not match");
+    }
+    match (value.format, &value.external) {
+        (3, Some(external))
+            if value.current.is_none() && value.previous.is_none() && value.releases.is_empty() =>
+        {
+            // Descriptor checks must not depend on the package still being installed.
+            external_location(paths, &external.path)?;
+            if value.blocks.iter().any(|block| block.path == external.path) {
+                bail!("external binary cannot be an owned integration target");
+            }
+        }
+        (1 | 2, None) => (),
+        _ => bail!("invalid or mixed managed/external installation manifest"),
+    }
+    if !matches!(value.shell_kind.as_str(), "bash" | "zsh")
+        || value.releases.iter().any(|s| !valid_digest(s))
+        || value
+            .current
+            .iter()
+            .chain(value.previous.iter())
+            .any(|s| !value.releases.contains(s))
+        || value.files.len() > 2
+        || value.blocks.len() > 2
+    {
+        bail!("invalid installation manifest entries");
+    }
+    let root = if value.format == 1 {
+        &paths.config
+    } else {
+        &paths.data
+    };
+    let mut names = std::collections::HashSet::new();
+    for file in &value.files {
+        if (file.path != root.join("integration.tmux") && file.path != root.join("integration.sh"))
+            || !names.insert(file.path.file_name())
+        {
+            bail!("manifest contains an unexpected owned file");
+        }
+    }
+    let mut kinds = std::collections::HashSet::new();
+    let mut targets = std::collections::HashSet::new();
+    for block in &value.blocks {
+        user_target(paths, &block.path)?;
+        block_range(block.text.as_bytes(), &block.text)?;
+        if !kinds.insert(block_kind(block)?) || !targets.insert(&block.path) {
+            bail!("manifest contains duplicate integration kinds or targets");
+        }
+    }
+    Ok(())
 }
 
 fn valid_digest(text: &str) -> bool {
@@ -188,6 +222,292 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn external_location(paths: &Paths, path: &Path) -> Result<()> {
+    checked_path(path).context("--external-binary requires an absolute stable path")?;
+    if [&paths.config, &paths.data, &paths.state]
+        .iter()
+        .any(|root| path.starts_with(root))
+    {
+        bail!("external binary cannot overlap app-managed config/data/state directories");
+    }
+    let components: Vec<_> = path.components().collect();
+    if components.windows(4).any(|parts| {
+        parts[0].as_os_str() == "Cellar"
+            && parts[2].as_os_str().to_str().is_some_and(|version| {
+                version.starts_with(|c: char| c.is_ascii_digit()) || version.starts_with("HEAD")
+            })
+    }) {
+        bail!("external binary must be stable, not a versioned Homebrew Cellar path; use the opt path");
+    }
+    Ok(())
+}
+
+// Inspect every directory and symlink hop, not only the canonical destination. Relative
+// symlinks (including Homebrew's ../Cellar targets) are intentional package indirection.
+fn trusted_path(path: &Path, package_directories: &[PathBuf]) -> Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    checked_path(path)?;
+    let mut pending: VecDeque<_> = path
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    let package_group = if package_directories.is_empty() {
+        None
+    } else {
+        homebrew_group()
+    };
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part)
+            .components()
+            .next()
+            .context("empty path component")?
+        {
+            Component::RootDir => resolved = PathBuf::from("/"),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                resolved.pop();
+                continue;
+            }
+            Component::Normal(_) => resolved.push(part),
+            _ => bail!("unsupported path component"),
+        }
+        let metadata = fs::symlink_metadata(&resolved)
+            .with_context(|| format!("inspect external path {}", resolved.display()))?;
+        if metadata.uid() != 0 && metadata.uid() != crate::config::uid() {
+            bail!(
+                "external path must be owned by root or the current user: {}",
+                resolved.display()
+            );
+        }
+        if metadata.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                bail!("too many external path symlinks");
+            }
+            let target = fs::read_link(&resolved)?;
+            if target
+                .to_str()
+                .context("non-UTF-8 symlink target")?
+                .chars()
+                .any(char::is_control)
+            {
+                bail!("unsafe external symlink target");
+            }
+            resolved.pop();
+            for component in target.components().rev() {
+                pending.push_front(component.as_os_str().to_owned());
+            }
+            continue;
+        }
+        let system_temporary = metadata.is_dir()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o1000 != 0
+            && matches!(
+                resolved.to_str(),
+                Some(
+                    "/tmp"
+                        | "/private/tmp"
+                        | "/var/tmp"
+                        | "/private/var/tmp"
+                        | "/private/var/folders"
+                        | "/var/folders"
+                )
+            );
+        let package_directory = metadata.is_dir()
+            && package_group == Some(metadata.gid())
+            && package_directories.contains(&resolved);
+        if metadata.mode() & 0o6000 != 0
+            || (metadata.mode() & 0o022 != 0
+                && !system_temporary
+                && !(package_directory && metadata.mode() & 0o002 == 0))
+        {
+            bail!(
+                "external path is setid or writable by untrusted group/others: {}",
+                resolved.display()
+            );
+        }
+        if !pending.is_empty() && !metadata.is_dir() {
+            bail!(
+                "external path ancestor is not a directory: {}",
+                resolved.display()
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+#[cfg(target_os = "linux")]
+fn homebrew_group() -> Option<u32> {
+    // Homebrew install.sh uses `id -gn`, the invoking user's effective primary group.
+    // SAFETY: getegid has no preconditions.
+    Some(unsafe { libc::getegid() })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn homebrew_group() -> Option<u32> {
+    let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
+    let mut buffer = [0u8; 16384];
+    let mut result = std::ptr::null_mut();
+    // SAFETY: the name is NUL-terminated and all output pointers refer to live buffers.
+    // Use the reentrant lookup: runtime helpers and tests can validate concurrently.
+    let status = unsafe {
+        libc::getgrnam_r(
+            c"admin".as_ptr(),
+            group.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: successful getgrnam_r populated result; copy the gid before buffers expire.
+    Some(unsafe { (*result).gr_gid })
+}
+
+// Explicit registration trusts macOS's admin group or Linux's effective primary group
+// ONLY on a verified same-prefix/formula opt -> Cellar route (or sibling bin symlink).
+// Linux also permits a group-writable prefix: install.sh creates it 0755 but retains
+// existing prefix modes. Ancestors ABOVE the prefix and the executable stay strict.
+// This is neither an ownership-layout requirement for other external paths nor an
+// app manifest/config exception. Policy source: Homebrew/install/HEAD/install.sh.
+fn homebrew_directories(path: &Path) -> Option<Vec<PathBuf>> {
+    if path.file_name()? != BINARY || path.parent()?.file_name()? != "bin" {
+        return None;
+    }
+    let target = path.canonicalize().ok()?;
+    if target.file_name()? != BINARY || target.parent()?.file_name()? != "bin" {
+        return None;
+    }
+    let keg = target.parent()?.parent()?;
+    let formula = keg.parent()?;
+    let cellar = formula.parent()?;
+    if cellar.file_name()? != "Cellar" {
+        return None;
+    }
+    let prefix = cellar.parent()?;
+    let opt = prefix.join("opt").join(formula.file_name()?);
+    if !fs::symlink_metadata(&opt).ok()?.file_type().is_symlink() || opt.canonicalize().ok()? != keg
+    {
+        return None;
+    }
+    let parent = path.parent()?.parent()?;
+    let sibling_bin = parent.canonicalize().ok()? == prefix
+        && fs::symlink_metadata(path).ok()?.file_type().is_symlink();
+    let stable_opt = parent.file_name() == formula.file_name()
+        && parent.parent()?.file_name()? == "opt"
+        && parent.parent()?.parent()?.canonicalize().ok()? == prefix;
+    if !sibling_bin && !stable_opt {
+        return None;
+    }
+    let mut directories = vec![
+        prefix.join("opt"),
+        prefix.join("bin"),
+        cellar.into(),
+        formula.into(),
+        keg.into(),
+        keg.join("bin"),
+    ];
+    if cfg!(target_os = "linux") {
+        directories.push(prefix.into());
+    }
+    // A sibling bin -> Cellar link does not itself traverse opt; the opt route
+    // authorizing this exception must still have trusted ownership/permissions.
+    trusted_path(&opt, &directories).ok()?;
+    Some(directories)
+}
+
+fn verify_external(paths: &Paths, path: &Path) -> Result<PathBuf> {
+    external_location(paths, path)?;
+    let resolved = trusted_path(path, &homebrew_directories(path).unwrap_or_default())?;
+    for root in [&paths.config, &paths.data, &paths.state] {
+        // Resolve existing ancestry even before the installer has created its directories.
+        let mut ancestor = root.as_path();
+        let mut suffix = Vec::new();
+        let canonical = loop {
+            match ancestor.canonicalize() {
+                Ok(canonical) => break canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(ancestor.file_name().context("missing root ancestor")?);
+                    ancestor = ancestor.parent().context("missing root parent")?;
+                }
+                Err(error) => return Err(error).context("resolve app directory"),
+            }
+        };
+        let canonical = suffix
+            .into_iter()
+            .rev()
+            .fold(canonical, |path, part| path.join(part));
+        if resolved.starts_with(canonical) {
+            bail!("external binary resolves into an app-managed directory");
+        }
+    }
+    let metadata = fs::metadata(&resolved)?;
+    if !metadata.is_file() || metadata.mode() & 0o111 == 0 || metadata.mode() & 0o6022 != 0 {
+        bail!(
+            "external target must be a regular executable, non-setid and not group/world writable"
+        );
+    }
+    let cpath = std::ffi::CString::new(resolved.as_os_str().as_encoded_bytes())?;
+    // SAFETY: cpath is NUL-terminated and access does not retain the pointer.
+    if unsafe { libc::access(cpath.as_ptr(), libc::X_OK) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("external target is not executable by this user");
+    }
+    Ok(resolved)
+}
+
+/// Read-only runtime selection. Preserve package indirection across upgrades, independently
+/// of the running image (which may already have been removed from the old Cellar).
+pub(crate) fn external_helper_path(paths: &Paths) -> Result<Option<PathBuf>> {
+    let (_, value) = read_manifest(paths)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    // Managed runtime selection historically ignores installer roots. Alternate XDG
+    // config/data roots must not invalidate its stable binary path. Still parse the
+    // complete schema so malformed/mixed external descriptors cannot fail open.
+    if matches!(value.format, 1 | 2) && value.external.is_none() {
+        return Ok(None);
+    }
+    validate_manifest(paths, &value)?;
+    let Some(external) = value.external.filter(|external| external.active) else {
+        return Ok(None);
+    };
+    trusted_path(&paths.state.join("install.json"), &[])?;
+    verify_external(paths, &external.path)
+        .context("registered external binary is unavailable or unsafe; repair it with your package manager, or uninstall the integrations")?;
+    Ok(Some(external.path))
+}
+
+fn external_state_ancestry(paths: &Paths) -> Result<()> {
+    checked_path(&paths.state)?;
+    // Check the nearest existing ancestor without creating future private components.
+    // lstat distinguishes an absent component from a dangling, untrusted symlink.
+    for ancestor in paths.state.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context("inspect external registration state ancestry")
+            }
+            Ok(_) => {
+                let resolved = trusted_path(ancestor, &[])
+                    .context("external registration requires trusted state ancestry")?;
+                if !fs::metadata(resolved)?.is_dir() {
+                    bail!("external registration state ancestor is not a directory");
+                }
+                return Ok(());
+            }
+        }
+    }
+    bail!("external registration state has no existing ancestor")
+}
+
 fn user_target(paths: &Paths, path: &Path) -> Result<()> {
     checked_path(path)?;
     if [&paths.config, &paths.data, &paths.state, &paths.bin]
@@ -232,13 +552,11 @@ fn integration(
     for path in [&paths.config, &paths.data, &paths.state, &paths.bin] {
         checked_path(path)?;
     }
-    let binary = shell_quote(
-        paths
-            .bin
-            .join(BINARY)
-            .to_str()
-            .context("non-UTF-8 binary path")?,
-    );
+    let binary_path = options
+        .external_binary
+        .clone()
+        .unwrap_or_else(|| paths.bin.join(BINARY));
+    let binary = shell_quote(binary_path.to_str().context("non-UTF-8 binary path")?);
     let tmux_file = paths.data.join("integration.tmux");
     let shell_file = paths.data.join("integration.sh");
     // Setness matters: even `-ic ''` is a tool command, not a human prompt.
@@ -444,7 +762,17 @@ pub fn install(options: InstallOptions) -> Result<()> {
 }
 
 fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<()> {
+    if let Some(path) = &options.external_binary {
+        external_location(paths, path)?;
+    }
     integration(paths, &options)?;
+    if options.external_binary.is_some()
+        || read_manifest(paths)?
+            .1
+            .is_some_and(|value| value.external.is_some() || value.format == 3)
+    {
+        external_state_ancestry(paths)?;
+    }
     let _lock = if options.yes {
         Some(lock(&paths.state)?)
     } else {
@@ -453,6 +781,64 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     let (manifest_before, old) = manifest(paths)?;
     let migrating = old.as_ref().is_some_and(|value| value.format == 1);
     let mut effective = options.clone();
+    if let Some(value) = &old {
+        match (&value.external, &options.external_binary) {
+            (Some(external), requested) => {
+                if !external.active {
+                    bail!("external integrations were uninstalled with residual user edits; review the retained content and finish uninstall before reinstalling");
+                }
+                if requested.as_ref().is_some_and(|path| path != &external.path) {
+                    bail!("external binary path cannot change; explicitly uninstall and reinstall with --external-binary");
+                }
+                effective.external_binary = Some(external.path.clone());
+            }
+            (None, Some(_)) => bail!("cannot switch a managed installation to external mode; explicitly uninstall and reinstall first"),
+            (None, None) => (),
+        }
+    }
+    if let Some(path) = &effective.external_binary {
+        external_state_ancestry(paths)?;
+        let resolved = verify_external(paths, path)?;
+        if resolved
+            != source
+                .canonicalize()
+                .context("resolve installation source")?
+        {
+            bail!("--external-binary must resolve to the running installation source; run {} install with this stable path (uninstall/reinstall to change registrations)", path.display());
+        }
+        for owned in [paths.data.join("current"), paths.data.join("releases")] {
+            match fs::symlink_metadata(&owned) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error).context("inspect managed payload"),
+                Ok(_) => bail!("external registration conflicts with managed payload at {}; uninstall/review it first", owned.display()),
+            }
+        }
+        if fs::read_link(paths.bin.join(BINARY))
+            .is_ok_and(|target| target == paths.data.join("current").join(BINARY))
+        {
+            bail!("external registration conflicts with a managed bin pointer; uninstall/review it first");
+        }
+        for target in options
+            .shell_config
+            .iter()
+            .chain(&options.tmux_config)
+            .chain(
+                old.iter()
+                    .flat_map(|value| value.blocks.iter().map(|block| &block.path)),
+            )
+        {
+            if absolute(target.clone())? == *path
+                || target.canonicalize().is_ok_and(|target| target == resolved)
+                || fs::metadata(target).is_ok_and(|target| {
+                    fs::metadata(&resolved).is_ok_and(|binary| {
+                        target.dev() == binary.dev() && target.ino() == binary.ino()
+                    })
+                })
+            {
+                bail!("external executable cannot be edited as a user integration");
+            }
+        }
+    }
     if let Some(old) = &old {
         if options.shell_config.is_none() {
             effective.shell_kind = Some(old.shell_kind.clone());
@@ -473,15 +859,23 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     }
     let (kind, files, mut blocks) = integration(paths, &effective)?;
     println!("Install agent-float-term from {}", source.display());
-    println!(
-        "  Releases: {}",
-        paths.data.join("releases/<sha256>").display()
-    );
-    println!(
-        "  Stable binary: {} -> {}",
-        paths.bin.join(BINARY).display(),
-        paths.data.join("current").join(BINARY).display()
-    );
+    if let Some(path) = &effective.external_binary {
+        println!(
+            "  External integration-only registration: {} (retained on plain reinstall)",
+            path.display()
+        );
+        println!("  The package manager owns the executable; no binary copy, chmod, release payload, or bin/current links. Use your package manager to update or roll back.");
+    } else {
+        println!(
+            "  Releases: {}",
+            paths.data.join("releases/<sha256>").display()
+        );
+        println!(
+            "  Stable binary: {} -> {}",
+            paths.bin.join(BINARY).display(),
+            paths.data.join("current").join(BINARY).display()
+        );
+    }
     for file in &files {
         println!("  Owned integration: {}", file.path.display());
     }
@@ -506,8 +900,12 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         println!("Preview only; pass --yes to apply. No files changed.");
         return Ok(());
     }
-    let bytes = native_binary(source)?;
-    let id = digest(&bytes);
+    let payload = if effective.external_binary.is_none() {
+        let bytes = native_binary(source)?;
+        Some((digest(&bytes), bytes))
+    } else {
+        None
+    };
     if let Some(old) = &old {
         for selected in &blocks {
             for installed in &old.blocks {
@@ -577,22 +975,27 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         edits.push((block.path.clone(), before, content));
     }
     private_dir(&paths.data)?;
-    ensure_user_dir(&paths.bin)?;
-    private_dir(&paths.data.join("releases"))?;
-    let current_before = owned_link(
-        &paths.data.join("current"),
-        old.as_ref()
-            .and_then(|m| m.current.as_deref())
-            .map(release_target)
-            .as_deref(),
-    )?;
-    let bin_before = owned_link(
-        &paths.bin.join(BINARY),
-        old.as_ref()
-            .and_then(|m| m.current.as_ref())
-            .map(|_| paths.data.join("current").join(BINARY))
-            .as_deref(),
-    )?;
+    let pointers = if payload.is_some() {
+        ensure_user_dir(&paths.bin)?;
+        private_dir(&paths.data.join("releases"))?;
+        let current_before = owned_link(
+            &paths.data.join("current"),
+            old.as_ref()
+                .and_then(|m| m.current.as_deref())
+                .map(release_target)
+                .as_deref(),
+        )?;
+        let bin_before = owned_link(
+            &paths.bin.join(BINARY),
+            old.as_ref()
+                .and_then(|m| m.current.as_ref())
+                .map(|_| paths.data.join("current").join(BINARY))
+                .as_deref(),
+        )?;
+        Some((current_before, bin_before))
+    } else {
+        None
+    };
     let mut next = old.clone().unwrap_or(Manifest {
         format: 2,
         paths: paths.clone(),
@@ -602,24 +1005,33 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         releases: Vec::new(),
         files: Vec::new(),
         blocks: Vec::new(),
+        external: None,
     });
     if let Some(current) = &next.current {
         verify_release(paths, current)?;
     }
     let mut tx = Transaction::new(&paths.state)?;
-    stage_release(&mut tx, paths, &id, &bytes)?;
+    if let Some((id, bytes)) = &payload {
+        stage_release(&mut tx, paths, id, bytes)?;
+    }
     // Install the new targets and repoint exact managed blocks before removing
     // legacy scripts. The transaction restores every changed file on failure.
     for (path, before, content) in edits.into_iter().chain(removals) {
         tx.change(&path, &before, content)?;
     }
-    if next.current.as_deref() != Some(&id) {
-        next.previous = next.current.replace(id.clone());
+    if let Some((id, _)) = &payload {
+        if next.current.as_deref() != Some(id) {
+            next.previous = next.current.replace(id.clone());
+        }
+        if !next.releases.contains(id) {
+            next.releases.push(id.clone());
+        }
     }
-    if !next.releases.contains(&id) {
-        next.releases.push(id.clone());
-    }
-    next.format = 2;
+    next.external = effective
+        .external_binary
+        .clone()
+        .map(|path| External { path, active: true });
+    next.format = if next.external.is_some() { 3 } else { 2 };
     next.files = files;
     if options.shell_config.is_some() {
         next.shell_kind = kind;
@@ -631,19 +1043,21 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
             next.blocks.push(block);
         }
     }
-    tx.change(
-        &paths.data.join("current"),
-        &current_before,
-        Content::Link(release_target(&id)),
-    )?;
-    tx.change(
-        &paths.bin.join(BINARY),
-        &bin_before,
-        Content::Link(paths.data.join("current").join(BINARY)),
-    )?;
+    if let (Some((id, _)), Some((current_before, bin_before))) = (&payload, &pointers) {
+        tx.change(
+            &paths.data.join("current"),
+            current_before,
+            Content::Link(release_target(id)),
+        )?;
+        tx.change(
+            &paths.bin.join(BINARY),
+            bin_before,
+            Content::Link(paths.data.join("current").join(BINARY)),
+        )?;
+    }
     write_manifest(&mut tx, paths, &manifest_before, &next)?;
     tx.commit()?;
-    println!("Installed {id}. Only selected or migration-owned startup blocks were edited; existing tmux sessions are untouched.");
+    println!("Installed {}. Only selected or migration-owned startup blocks were edited; existing tmux sessions are untouched.", payload.as_ref().map_or("external integrations", |(id, _)| id.as_str()));
     Ok(())
 }
 
@@ -669,6 +1083,7 @@ pub fn update(from: &Path, sha256: &str) -> Result<()> {
 }
 
 fn update_at(paths: &Paths, from: &Path, sha256: &str) -> Result<()> {
+    reject_external_update(paths)?;
     let expected = sha256.to_ascii_lowercase();
     if !valid_digest(&expected) {
         bail!("--sha256 must be exactly 64 hexadecimal characters");
@@ -682,6 +1097,9 @@ fn update_at(paths: &Paths, from: &Path, sha256: &str) -> Result<()> {
     private_dir(&paths.data)?;
     let (before, value) = manifest(paths)?;
     let mut value = value.context("not installed; run install --yes first")?;
+    if value.external.is_some() {
+        bail!("external executable is package-managed; update or roll back with your package manager instead");
+    }
     let current = value
         .current
         .as_deref()
@@ -717,11 +1135,25 @@ pub fn rollback() -> Result<()> {
     rollback_at(&Paths::discover()?)
 }
 
+fn reject_external_update(paths: &Paths) -> Result<()> {
+    if manifest(paths)?
+        .1
+        .is_some_and(|value| value.external.is_some())
+    {
+        bail!("external executable is package-managed; update or roll back with your package manager (for example brew upgrade or cargo install), not agent-float-term update/rollback");
+    }
+    Ok(())
+}
+
 fn rollback_at(paths: &Paths) -> Result<()> {
+    reject_external_update(paths)?;
     let _lock = lock(&paths.state)?;
     private_dir(&paths.data)?;
     let (before, value) = manifest(paths)?;
     let mut value = value.context("not installed")?;
+    if value.external.is_some() {
+        bail!("external executable is package-managed; update or roll back with your package manager instead");
+    }
     let previous = value
         .previous
         .clone()
@@ -794,7 +1226,14 @@ fn uninstall_at_with_hook(
     for file in &preview.files {
         println!("  Remove unmodified integration: {}", file.path.display());
     }
-    println!("  Remove owned binary pointers and checksum-intact release payloads; retain private backups and user configuration.");
+    if let Some(external) = &preview.external {
+        println!(
+            "  Leave package-owned executable untouched (even if missing/replaced): {}",
+            external.path.display()
+        );
+    } else {
+        println!("  Remove owned binary pointers and checksum-intact release payloads; retain private backups and user configuration.");
+    }
     if !yes {
         println!("Preview only; pass --yes to apply. No files changed.");
         return Ok(());
@@ -897,6 +1336,9 @@ fn uninstall_at_with_hook(
     value.releases = retained_releases;
     value.current = None;
     value.previous = None;
+    if let Some(external) = &mut value.external {
+        external.active = false;
+    }
     before_remove()
         .context("runtime integration cleanup failed; installed files were not removed")?;
     let mut tx = Transaction::new(&paths.state)?;
@@ -920,7 +1362,9 @@ fn uninstall_at_with_hook(
             let _ = fs::remove_dir(paths.data.join("releases").join(id));
         }
     }
-    let _ = fs::remove_dir(paths.data.join("releases"));
+    if preview.external.is_none() {
+        let _ = fs::remove_dir(paths.data.join("releases"));
+    }
     println!("Uninstalled owned content. Sessions, user configuration, user edits, and private backups were preserved.");
     Ok(())
 }
@@ -951,6 +1395,7 @@ mod tests {
                 bin: home.join(".local/bin"),
             };
             let options = InstallOptions {
+                external_binary: None,
                 tmux_config: Some(home.join(".tmux.conf")),
                 shell_config: Some(home.join(".bashrc")),
                 shell_kind: Some("bash".into()),
@@ -980,6 +1425,615 @@ mod tests {
         bytes[63] = discriminator;
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn external_preview_reinstall_and_uninstall_never_own_package_payload() {
+        let mut fixture = Fixture::new();
+        fixture.options.external_binary = Some(fixture.source.clone());
+        fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o755)).unwrap();
+        let original = snapshot(&fixture.source).unwrap();
+        let mut preview = fixture.options.clone();
+        preview.yes = false;
+        install_at(&fixture.paths, preview, &fixture.source).unwrap();
+        for path in [
+            &fixture.paths.config,
+            &fixture.paths.data,
+            &fixture.paths.state,
+            &fixture.paths.bin,
+        ] {
+            assert!(!path.exists());
+        }
+        fixture.install().unwrap();
+        let value = manifest(&fixture.paths).unwrap().1.unwrap();
+        assert_eq!(value.format, 3);
+        assert!(value.current.is_none() && value.previous.is_none() && value.releases.is_empty());
+        assert_eq!(
+            external_helper_path(&fixture.paths).unwrap(),
+            Some(fixture.source.clone())
+        );
+        let before = snapshot(&fixture.paths.state.join("install.json")).unwrap();
+        install_at(
+            &fixture.paths,
+            InstallOptions {
+                yes: true,
+                ..Default::default()
+            },
+            &fixture.source,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+            before
+        );
+        assert!(update_at(&fixture.paths, Path::new("/missing"), "invalid")
+            .unwrap_err()
+            .to_string()
+            .contains("package manager"));
+        assert!(rollback_at(&fixture.paths)
+            .unwrap_err()
+            .to_string()
+            .contains("package manager"));
+        assert_eq!(
+            snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+            before
+        );
+        assert_eq!(snapshot(&fixture.source).unwrap(), original);
+        assert!(!fixture.paths.data.join("releases").exists());
+        assert!(!fixture.paths.data.join("current").exists());
+        assert!(!fixture.paths.bin.exists());
+        uninstall_at_with_hook(&fixture.paths, false, || panic!("preview hook")).unwrap();
+        assert_eq!(
+            snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+            before
+        );
+        assert!(uninstall_at_with_hook(&fixture.paths, true, || bail!("hook failed")).is_err());
+        assert_eq!(
+            snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+            before
+        );
+        assert!(fixture.paths.data.join("integration.sh").exists());
+        let called = std::cell::Cell::new(false);
+        uninstall_at_with_hook(&fixture.paths, true, || {
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(called.get());
+        assert_eq!(snapshot(&fixture.source).unwrap(), original);
+        assert!(external_helper_path(&fixture.paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn external_opt_retarget_survives_removed_running_image() {
+        let mut fixture = Fixture::new();
+        let prefix = fixture.source.parent().unwrap().join("brew");
+        let old = prefix.join("Cellar/agent-float-term/1/bin");
+        let new = prefix.join("Cellar/agent-float-term/2/bin");
+        let opt = prefix.join("opt/agent-float-term");
+        private_dir(&old).unwrap();
+        private_dir(&new).unwrap();
+        private_dir(opt.parent().unwrap()).unwrap();
+        write_binary(&old.join(BINARY), 1);
+        write_binary(&new.join(BINARY), 2);
+        symlink("../Cellar/agent-float-term/1", &opt).unwrap();
+        let stable = opt.join("bin").join(BINARY);
+        fixture.source = old.join(BINARY);
+        fixture.options.external_binary = Some(stable.clone());
+        fixture.install().unwrap();
+        fs::remove_file(&opt).unwrap();
+        symlink("../Cellar/agent-float-term/2", &opt).unwrap();
+        fs::remove_dir_all(old.parent().unwrap()).unwrap();
+        let before = snapshot(&fixture.paths.state.join("install.json")).unwrap();
+        assert_eq!(
+            external_helper_path(&fixture.paths).unwrap(),
+            Some(stable.clone())
+        );
+        assert_eq!(
+            snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+            before
+        );
+        install_at(
+            &fixture.paths,
+            InstallOptions {
+                yes: true,
+                ..Default::default()
+            },
+            &new.join(BINARY),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest(&fixture.paths)
+                .unwrap()
+                .1
+                .unwrap()
+                .external
+                .unwrap()
+                .path,
+            stable
+        );
+        assert!(external_location(&fixture.paths, &new.join(BINARY))
+            .unwrap_err()
+            .to_string()
+            .contains("opt"));
+        fs::set_permissions(new.join(BINARY), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(external_helper_path(&fixture.paths).is_err());
+        uninstall_at(&fixture.paths, true).unwrap();
+        assert_eq!(
+            fs::metadata(new.join(BINARY)).unwrap().mode() & 0o777,
+            0o777
+        );
+        assert!(fs::symlink_metadata(opt).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn external_residual_is_inactive_even_when_package_is_missing_or_replaced() {
+        for missing in [false, true] {
+            let mut fixture = Fixture::new();
+            fixture.options.external_binary = Some(fixture.source.clone());
+            fixture.install().unwrap();
+            let script = fixture.paths.data.join("integration.sh");
+            fs::write(&script, "# user-edited integration\n").unwrap();
+            if missing {
+                fs::remove_file(&fixture.source).unwrap();
+            } else {
+                write_binary(&fixture.source, 9);
+                fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let original = snapshot(&fixture.source).unwrap();
+            uninstall_at(&fixture.paths, true).unwrap();
+            let value = manifest(&fixture.paths).unwrap().1.unwrap();
+            assert!(!value.external.unwrap().active);
+            assert_eq!(value.files.len(), 1);
+            assert!(external_helper_path(&fixture.paths).unwrap().is_none());
+            assert_eq!(
+                fs::read_to_string(&script).unwrap(),
+                "# user-edited integration\n"
+            );
+            assert_eq!(snapshot(&fixture.source).unwrap(), original);
+            assert!(fixture.install().is_err());
+            fs::remove_file(script).unwrap();
+            uninstall_at(&fixture.paths, true).unwrap();
+            assert!(!fixture.paths.state.join("install.json").exists());
+            assert_eq!(snapshot(&fixture.source).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn homebrew_platform_group_directories_are_a_package_only_trust_exception() {
+        let Some(group) = homebrew_group() else {
+            eprintln!("no Homebrew platform group; group-writable exception is disabled");
+            return;
+        };
+        let mut fixture = Fixture::new();
+        let prefix = fixture
+            .source
+            .parent()
+            .unwrap()
+            .join(if cfg!(target_os = "linux") {
+                "linuxbrew/.linuxbrew"
+            } else {
+                "brew"
+            });
+        let keg = prefix.join("Cellar/agent-float-term/1");
+        let opt = prefix.join("opt/agent-float-term");
+        let bin = prefix.join("bin");
+        private_dir(&keg.join("bin")).unwrap();
+        private_dir(opt.parent().unwrap()).unwrap();
+        private_dir(&bin).unwrap();
+        if std::os::unix::fs::chown(&bin, None, Some(group)).is_err() {
+            eprintln!("test user cannot create platform-group-owned fixtures; group-writable exception not exercised");
+            return;
+        }
+        fs::set_permissions(&prefix, fs::Permissions::from_mode(0o755)).unwrap();
+        write_binary(&keg.join("bin").join(BINARY), 1);
+        symlink("../Cellar/agent-float-term/1", &opt).unwrap();
+        let stable = opt.join("bin").join(BINARY);
+        let sibling = bin.join(BINARY);
+        symlink(
+            "../Cellar/agent-float-term/1/bin/agent-float-term",
+            &sibling,
+        )
+        .unwrap();
+        let directories = homebrew_directories(&stable).unwrap();
+        for directory in &directories {
+            std::os::unix::fs::chown(directory, None, Some(group)).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        fixture.source = keg.join("bin").join(BINARY);
+        fixture.options.external_binary = Some(stable.clone());
+        fixture.install().unwrap();
+        assert_eq!(
+            external_helper_path(&fixture.paths).unwrap(),
+            Some(stable.clone())
+        );
+        assert!(verify_external(&fixture.paths, &sibling).is_ok());
+        fs::set_permissions(opt.parent().unwrap(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(verify_external(&fixture.paths, &sibling).is_err());
+        fs::set_permissions(opt.parent().unwrap(), fs::Permissions::from_mode(0o775)).unwrap();
+        // Both forms shipped by package managers: sibling bin -> Cellar and bin -> opt.
+        fs::remove_file(&sibling).unwrap();
+        symlink("../opt/agent-float-term/bin/agent-float-term", &sibling).unwrap();
+        assert!(verify_external(&fixture.paths, &sibling).is_ok());
+        assert!(trusted_path(&stable, &[]).is_err());
+        let mut app_paths = fixture.paths.clone();
+        app_paths.state = keg.join("app-state");
+        fs::create_dir(&app_paths.state).unwrap();
+        fs::set_permissions(&app_paths.state, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut app_manifest = manifest(&fixture.paths).unwrap().1.unwrap();
+        app_manifest.paths = app_paths.clone();
+        let app_manifest_path = app_paths.state.join("install.json");
+        fs::write(
+            &app_manifest_path,
+            serde_json::to_vec(&app_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&app_manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        // Even a private manifest leaf cannot borrow the package ancestry exception.
+        assert!(external_helper_path(&app_paths).is_err());
+        for directory in &directories {
+            for mode in [0o777, 0o1777, 0o2775, 0o4775] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(mode)).unwrap();
+                // opt does not traverse the sibling bin directory.
+                let candidate = if directory == &bin.canonicalize().unwrap() {
+                    &sibling
+                } else {
+                    &stable
+                };
+                assert!(
+                    verify_external(&fixture.paths, candidate).is_err(),
+                    "{} {mode:o}",
+                    directory.display()
+                );
+            }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        fs::set_permissions(&prefix, fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(
+            verify_external(&fixture.paths, &stable).is_ok(),
+            cfg!(target_os = "linux")
+        );
+        fs::set_permissions(&prefix, fs::Permissions::from_mode(0o755)).unwrap();
+        let parent_mode = fs::metadata(prefix.parent().unwrap())
+            .unwrap()
+            .permissions();
+        fs::set_permissions(prefix.parent().unwrap(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(verify_external(&fixture.paths, &stable).is_err());
+        fs::set_permissions(prefix.parent().unwrap(), parent_mode).unwrap();
+        fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(verify_external(&fixture.paths, &stable).is_err());
+        fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o755)).unwrap();
+        // A different group does not inherit platform-group trust, even with matching layout.
+        if std::os::unix::fs::chown(opt.parent().unwrap(), None, Some(group.wrapping_add(1)))
+            .is_ok()
+        {
+            assert!(verify_external(&fixture.paths, &stable).is_err());
+            std::os::unix::fs::chown(opt.parent().unwrap(), None, Some(group)).unwrap();
+        }
+        // A sibling bin link must resolve to the currently selected opt keg.
+        let other = prefix.join("Cellar/agent-float-term/2/bin");
+        fs::create_dir_all(&other).unwrap();
+        write_binary(&other.join(BINARY), 2);
+        fs::remove_file(&sibling).unwrap();
+        symlink(
+            "../Cellar/agent-float-term/2/bin/agent-float-term",
+            &sibling,
+        )
+        .unwrap();
+        assert!(verify_external(&fixture.paths, &sibling).is_err());
+        // Unrelated group-writable paths and cross-prefix/cross-formula opt links fail.
+        let unrelated = prefix.join("unrelated");
+        private_dir(&unrelated).unwrap();
+        std::os::unix::fs::chown(&unrelated, None, Some(group)).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o775)).unwrap();
+        symlink(&fixture.source, unrelated.join(BINARY)).unwrap();
+        assert!(verify_external(&fixture.paths, &unrelated.join(BINARY)).is_err());
+        let alias = prefix.join("opt/other-formula");
+        symlink("../Cellar/agent-float-term/1", &alias).unwrap();
+        assert!(verify_external(&fixture.paths, &alias.join("bin").join(BINARY)).is_err());
+        let outside = fixture._temp.path().join("other-prefix/opt");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&keg, outside.join("agent-float-term")).unwrap();
+        assert!(verify_external(
+            &fixture.paths,
+            &outside.join("agent-float-term/bin").join(BINARY)
+        )
+        .is_err());
+        uninstall_at(&fixture.paths, true).unwrap();
+        assert!(fixture.source.exists());
+    }
+
+    #[test]
+    fn external_metadata_and_mode_changes_are_rejected() {
+        let mut fixture = Fixture::new();
+        fixture.install().unwrap();
+        fixture.options.external_binary = Some(fixture.source.clone());
+        assert!(fixture
+            .install()
+            .unwrap_err()
+            .to_string()
+            .contains("uninstall"));
+        uninstall_at(&fixture.paths, true).unwrap();
+        fixture.install().unwrap();
+        let path = fixture.paths.state.join("install.json");
+        let original = fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        for case in [
+            "format",
+            "missing descriptor",
+            "unknown field",
+            "missing active",
+            "relative",
+            "overlap",
+            "cellar",
+            "current",
+            "previous",
+            "releases",
+        ] {
+            let mut invalid = value.clone();
+            match case {
+                "format" => invalid["format"] = 2.into(),
+                "missing descriptor" => {
+                    invalid.as_object_mut().unwrap().remove("external");
+                }
+                "unknown field" => invalid["external"]["owned"] = true.into(),
+                "missing active" => {
+                    invalid["external"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("active");
+                }
+                "relative" => invalid["external"]["path"] = "relative/bin".into(),
+                "overlap" => {
+                    invalid["external"]["path"] =
+                        fixture.paths.data.join(BINARY).to_str().unwrap().into()
+                }
+                "cellar" => {
+                    invalid["external"]["path"] =
+                        "/opt/homebrew/Cellar/agent-float-term/1/bin/agent-float-term".into()
+                }
+                "current" => invalid["current"] = "a".repeat(64).into(),
+                "previous" => invalid["previous"] = "a".repeat(64).into(),
+                "releases" => invalid["releases"] = serde_json::json!(["a".repeat(64)]),
+                _ => unreachable!(),
+            }
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(manifest(&fixture.paths).is_err(), "{case}");
+            assert!(external_helper_path(&fixture.paths).is_err(), "{case}");
+            assert!(uninstall_at(&fixture.paths, true).is_err(), "{case}");
+        }
+        fs::write(&path, original).unwrap();
+        let alias = fixture.source.with_file_name("another-stable-name");
+        symlink(&fixture.source, &alias).unwrap();
+        fixture.options.external_binary = Some(alias);
+        assert!(fixture
+            .install()
+            .unwrap_err()
+            .to_string()
+            .contains("uninstall"));
+    }
+
+    #[test]
+    fn external_registration_preflights_state_ancestry_before_any_writes() {
+        for existing in [false, true] {
+            for symlinked in [false, true] {
+                let mut fixture = Fixture::new();
+                let shared = fixture._temp.path().join("shared");
+                private_dir(&shared).unwrap();
+                let parent = if symlinked {
+                    let link = fixture._temp.path().join("shared-link");
+                    symlink(&shared, &link).unwrap();
+                    link
+                } else {
+                    shared.clone()
+                };
+                fixture.paths.state = parent.join("future/agent-float-term");
+                if existing {
+                    fs::create_dir_all(shared.join("future/agent-float-term")).unwrap();
+                    fs::set_permissions(&fixture.paths.state, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+                fixture.options.external_binary = Some(fixture.source.clone());
+                let source_before = snapshot(&fixture.source).unwrap();
+                for yes in [false, true] {
+                    fixture.options.yes = yes;
+                    assert!(fixture
+                        .install()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("trusted state ancestry"));
+                    assert_eq!(fixture.paths.state.exists(), existing);
+                    assert!(!fixture.paths.state.join("install.lock").exists());
+                    assert!(!fixture.paths.state.join("install.json").exists());
+                    assert!(!fixture.paths.state.join("backups").exists());
+                    assert!(!fixture.paths.data.exists());
+                    assert!(!fixture.paths.config.exists());
+                    assert!(!fixture.options.shell_config.as_ref().unwrap().exists());
+                    assert!(!fixture.options.tmux_config.as_ref().unwrap().exists());
+                    assert_eq!(snapshot(&fixture.source).unwrap(), source_before);
+                    if !existing {
+                        assert!(!shared.join("future").exists());
+                    }
+                }
+            }
+        }
+        // A plain reinstall must detect the recorded external mode before taking a lock.
+        let mut fixture = Fixture::new();
+        let shared = fixture._temp.path().join("shared");
+        private_dir(&shared).unwrap();
+        fixture.paths.state = shared.join("agent-float-term");
+        fixture.options.external_binary = Some(fixture.source.clone());
+        fixture.install().unwrap();
+        fs::remove_file(fixture.paths.state.join("install.lock")).unwrap();
+        let before = snapshot(&fixture.paths.state.join("install.json")).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+        for yes in [false, true] {
+            let error = install_at(
+                &fixture.paths,
+                InstallOptions {
+                    yes,
+                    ..Default::default()
+                },
+                &fixture.source,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("trusted state ancestry"));
+            assert_eq!(
+                snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+                before
+            );
+            assert!(!fixture.paths.state.join("install.lock").exists());
+        }
+    }
+
+    #[test]
+    fn runtime_managed_selection_allows_alternate_xdg_roots_but_external_does_not() {
+        for legacy in [false, true] {
+            let fixture = Fixture::new();
+            assert!(external_helper_path(&fixture.paths).unwrap().is_none());
+            if legacy {
+                legacy_install(&fixture);
+            } else {
+                fixture.install().unwrap();
+            }
+            let mut alternate = fixture.paths.clone();
+            alternate.config = fixture
+                ._temp
+                .path()
+                .join("alternate-config/agent-float-term");
+            alternate.data = fixture._temp.path().join("alternate-data/agent-float-term");
+            let before = snapshot(&fixture.paths.state.join("install.json")).unwrap();
+            assert!(manifest(&alternate).is_err());
+            // None leaves helper_path's existing managed bin/current-exe fallback intact.
+            assert!(external_helper_path(&alternate).unwrap().is_none());
+            assert_eq!(
+                snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+                before
+            );
+            assert!(!alternate.config.exists() && !alternate.data.exists());
+        }
+        let mut fixture = Fixture::new();
+        fixture.options.external_binary = Some(fixture.source.clone());
+        fixture.install().unwrap();
+        let mut alternate = fixture.paths.clone();
+        alternate.config = fixture
+            ._temp
+            .path()
+            .join("alternate-config/agent-float-term");
+        alternate.data = fixture._temp.path().join("alternate-data/agent-float-term");
+        assert!(external_helper_path(&alternate).is_err());
+        let path = fixture.paths.state.join("install.json");
+        let value = manifest(&fixture.paths).unwrap().1.unwrap();
+        for case in [
+            "managed with external",
+            "missing external",
+            "bad owned file",
+            "bad external type",
+        ] {
+            let mut invalid = serde_json::to_value(&value).unwrap();
+            match case {
+                "managed with external" => invalid["format"] = 2.into(),
+                "missing external" => {
+                    invalid.as_object_mut().unwrap().remove("external");
+                }
+                "bad owned file" => {
+                    invalid["files"][0]["path"] = "/unowned/integration.tmux".into()
+                }
+                "bad external type" => invalid["external"] = true.into(),
+                _ => unreachable!(),
+            }
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(external_helper_path(&fixture.paths).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn external_paths_require_trusted_ancestry_and_the_running_source() {
+        let mut fixture = Fixture::new();
+        fixture.options.yes = false;
+        for mode in [0o644, 0o775, 0o757, 0o4755, 0o2755] {
+            fs::set_permissions(&fixture.source, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                verify_external(&fixture.paths, &fixture.source).is_err(),
+                "{mode:o}"
+            );
+        }
+        fs::set_permissions(&fixture.source, fs::Permissions::from_mode(0o755)).unwrap();
+        for path in [
+            PathBuf::from("relative"),
+            fixture.source.with_file_name("bad\nname"),
+            fixture.source.join("../download"),
+        ] {
+            assert!(verify_external(&fixture.paths, &path).is_err());
+        }
+        let directory = fixture.source.with_file_name("untrusted");
+        private_dir(&directory).unwrap();
+        let alias = directory.join(BINARY);
+        symlink(&fixture.source, &alias).unwrap();
+        for mode in [0o777, 0o1777, 0o775] {
+            fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(verify_external(&fixture.paths, &alias).is_err(), "{mode:o}");
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(verify_external(&fixture.paths, &alias).is_ok());
+        // System-owned executables are trusted too, without changing their permissions.
+        assert!(verify_external(&fixture.paths, Path::new("/usr/bin/true")).is_ok());
+        assert!(verify_external(&fixture.paths, &directory).is_err());
+        let cycle = directory.join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(verify_external(&fixture.paths, &cycle).is_err());
+        let other = fixture.source.with_file_name("different-source");
+        write_binary(&other, 1);
+        fixture.options.external_binary = Some(other);
+        assert!(fixture
+            .install()
+            .unwrap_err()
+            .to_string()
+            .contains("running installation source"));
+        private_dir(&fixture.paths.data).unwrap();
+        let managed = fixture.paths.data.join(BINARY);
+        write_binary(&managed, 1);
+        let alias = fixture.source.with_file_name("managed-alias");
+        symlink(managed, &alias).unwrap();
+        assert!(verify_external(&fixture.paths, &alias).is_err());
+        assert!(!fixture.paths.state.exists());
+    }
+
+    #[test]
+    fn external_registration_refuses_untracked_managed_payload_and_binary_edits() {
+        let mut fixture = Fixture::new();
+        fixture.options.external_binary = Some(fixture.source.clone());
+        fixture.options.yes = false;
+        private_dir(&fixture.paths.data).unwrap();
+        for name in ["releases", "current"] {
+            let occupied = fixture.paths.data.join(name);
+            private_dir(&occupied).unwrap();
+            assert!(fixture
+                .install()
+                .unwrap_err()
+                .to_string()
+                .contains("managed payload"));
+            fs::remove_dir(occupied).unwrap();
+        }
+        private_dir(&fixture.paths.bin).unwrap();
+        let pointer = fixture.paths.bin.join(BINARY);
+        symlink(fixture.paths.data.join("current").join(BINARY), &pointer).unwrap();
+        assert!(fixture
+            .install()
+            .unwrap_err()
+            .to_string()
+            .contains("managed bin pointer"));
+        fs::remove_file(pointer).unwrap();
+        let alias = fixture.source.with_file_name("binary-hardlink");
+        fs::hard_link(&fixture.source, &alias).unwrap();
+        fixture.options.shell_config = Some(alias);
+        assert!(fixture
+            .install()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be edited"));
+        assert!(!fixture.paths.state.exists());
     }
 
     #[test]
@@ -1286,6 +2340,7 @@ mod tests {
             };
             let options = InstallOptions {
                 tmux_config: (index == 0).then(|| defaults[index].clone()),
+                external_binary: None,
                 shell_config: (index != 0).then(|| defaults[index].clone()),
                 shell_kind: (index != 0).then(|| selected.into()),
                 yes: true,
