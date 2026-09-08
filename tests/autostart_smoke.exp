@@ -63,8 +63,10 @@ proc attached {} {
 }
 proc finish {viewer seconds} {
     global viewers
-    expect -i $viewer -timeout $seconds eof {} timeout {error "shell command exceeded ${seconds}s exit bound"}
-    set output $expect_out(buffer)
+    set output ""
+    expect -i $viewer -timeout $seconds \
+        -re {.+} {append output $expect_out(0,string); exp_continue -continue_timer} \
+        eof {} timeout {error "shell command exceeded ${seconds}s exit bound; output: $output"}
     set status [wait -i $viewer]
     set viewers [lsearch -all -inline -not -exact $viewers $viewer]
     check {[lindex $status 2] == 0 && [lindex $status 3] == 0} "shell failed: $status"
@@ -124,6 +126,9 @@ unsetopt zle prompt_cr prompt_sp
     check {[exec $installed --version] eq [exec $binary --version]} "installed payload version differs"
     check {![file exists [file join $env(XDG_CONFIG_HOME) agent-float-term config.json]]} "test must use default application configuration"
     set observed [file join $env(HOME) rc-observed]
+    # Skip host rc files, including Ubuntu's compinit prompt before our .zshrc.
+    # .zshenv also covers the ordinary shells launched by the dedicated server.
+    write_private [file join $env(ZDOTDIR) .zshenv] {unsetopt GLOBAL_RCS}
     # Only this disposable rc is sourced, never the real user's .zshrc.
     write_private [file join $env(ZDOTDIR) .zshrc] "source '$rc'\n[string trim {
 print -r -- "rc:$-:${+functions[__aft_initialize]}:${_AFT_AUTO_STARTED-unset}" >> "$HOME/rc-observed"

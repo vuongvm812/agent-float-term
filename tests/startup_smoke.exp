@@ -176,7 +176,9 @@ set failed [catch {
     send -i $first -- {printf 'AFT_START_%s:%s\n' "$PWD" "$AFT_DISABLE"}
     send -i $first -- "\r"
     eventually {contains $first_pane "AFT_START_$work:1"} "literal hash/dollar cwd and recursion guard"
-    check {[tm display-message -p -t $first_pane {#{pane_current_path}}] eq $work} "start expanded literal cwd characters"
+    # tmux 3.4 escapes '$' in printed metadata. Render the expected path the same
+    # way without expanding formats; the shell output above checks the raw cwd.
+    check {[tm display-message -p -t $first_pane {#{pane_current_path}}] eq [tm display-message -p -l $work]} "start expanded literal cwd characters"
 
     # Running start inside that shell must not create a nested outer session.
     send -i $first -- "'$binary' start\r"
