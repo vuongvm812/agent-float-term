@@ -1,0 +1,248 @@
+#!/usr/bin/env expect
+# EXPERIMENTAL, not a backend or a shipping gate pass. No application build needed.
+# Run from any directory: expect tests/native_pane_probe.exp
+# All mouse/prefix/shell input traverses the attached outer client's PTY.
+set timeout 5
+log_user 0
+if {$argc != 0} {
+    puts stderr "usage: expect tests/native_pane_probe.exp"
+    exit 1
+}
+foreach tool {tmux bash mktemp} {
+    if {[auto_execok $tool] eq ""} {
+        puts stderr "native pane probe requires $tool"
+        exit 1
+    }
+}
+set tmux [lindex [auto_execok tmux] 0]
+set shell [lindex [auto_execok bash] 0]
+set root ""
+set socket ""
+set client ""
+set deadline [expr {[clock milliseconds] + 45000}]
+
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} {
+    global tmux socket
+    return [exec $tmux -S $socket -f /dev/null {*}$args]
+}
+proc drain {} {
+    global client
+    if {$client ne ""} {
+        expect -i $client -timeout 0 -re {.+} {} timeout {} eof {error "outer client exited"}
+    }
+}
+proc eventually {script message} {
+    global deadline
+    set until [expr {min($deadline, [clock milliseconds] + 5000)}]
+    while {[clock milliseconds] < $until} {
+        drain
+        if {[uplevel 1 $script]} { return }
+        after 25
+    }
+    error "timed out: $message"
+}
+proc type {text} {
+    global client
+    send -i $client -- $text
+}
+proc contains {pane text} {
+    return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}]
+}
+proc status_binding {} {
+    foreach line [split [tm list-keys -T root] \n] {
+        if {[regexp {^bind-key +(?:-r +)?-T +root +MouseDown1Status +} $line]} { return $line }
+    }
+    error "default MouseDown1Status binding missing"
+}
+proc state_is {path expected} {
+    if {![file exists $path]} { return 0 }
+    set input [open $path r]
+    set actual [read $input]
+    close $input
+    return [expr {$actual eq $expected}]
+}
+proc client_session {name} {
+    foreach line [split [tm list-clients -F {#{client_name}|#{session_name}}] \n] {
+        lassign [split $line |] actual session
+        if {$actual eq $name} { return $session }
+    }
+    return ""
+}
+proc float_viewer {main} {
+    global tmux socket retained env
+    # new-pane creates the float; do not try to move the retained shell into it.
+    # Multiple argv avoid shell quoting; env -u permits this deliberate nesting.
+    set pane [tm new-pane -t $main -x 60 -y 16 -X 20 -Y 5 -P -F {#{pane_id}} \
+        -c $env(HOME) env -u TMUX $tmux -S $socket -f /dev/null attach-session -t $retained]
+    check {[tm display-message -p -t $pane {#{pane_floating_flag}|#{pane_active}|#{pane_width}|#{pane_height}|#{pane_left}|#{pane_top}}] eq "1|1|60|16|20|5"} \
+        "new-pane did not create an active native 60x16 float at 20,5"
+    check {[tm display-message -p -t $main {#{pane_width}|#{pane_height}}] eq "120|39"} "float split the main pane"
+    eventually {expr {[tm display-message -p -t $retained {#{session_attached}}] == 1}} "nested viewer attached"
+    puts "PASS native float $pane: [tm display-message -p -t $pane {floating=#{pane_floating_flag} active=#{pane_active} size=#{pane_width}x#{pane_height} origin=#{pane_left},#{pane_top}}]"
+    return $pane
+}
+proc click {column expected count} {
+    global outer
+    # SGR left-button press AND release, terminal coordinates are one-based.
+    type "\033\[<0;${column};1M\033\[<0;${column};1m"
+    eventually {expr {[client_session $outer] eq $expected && [tm show-options -gqv @session_changes] == $count}} \
+        "one main-client switch to $expected"
+    # Catch duplicate release-triggered transitions, draining redraws.
+    set until [expr {[clock milliseconds] + 350}]
+    while {[clock milliseconds] < $until} { drain; after 25 }
+    check {[client_session $outer] eq $expected} "main client switched again"
+    check {[tm show-options -gqv @session_changes] == $count} "duplicate session transition"
+    puts "PASS SGR click ($column,1): outer=$outer session=$expected transitions=$count (cumulative)"
+}
+proc teardown {} {
+    global root socket client tmux
+    if {$socket ne "" && [file exists $socket]} {
+        catch {exec $tmux -S $socket -f /dev/null kill-server}
+    }
+    if {$client ne ""} {
+        catch {close -i $client}
+        catch {wait -i $client}
+    }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {teardown; exit 1} {SIGINT SIGTERM SIGHUP}
+
+set failed [catch {
+    # Short, private socket paths fit macOS sockaddr_un. Never use a live socket.
+    set root [file normalize [exec mktemp -d /tmp/aft-native.XXXXXXXX]]
+    file attributes $root -permissions 0700
+    set inherited_path $env(PATH)
+    # Preserve Tcl's env-array trace while removing TMUX, shell startup variables,
+    # and all other inherited configuration from every child process.
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) $inherited_path
+    set env(HOME) [file join $root home]
+    set env(XDG_CONFIG_HOME) [file join $root config]
+    set env(XDG_DATA_HOME) [file join $root data]
+    set env(XDG_STATE_HOME) [file join $root state]
+    set env(XDG_RUNTIME_DIR) [file join $root runtime]
+    set env(TMUX_TMPDIR) [file join $root sockets]
+    set env(TMPDIR) [file join $root tmp]
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set env(LC_ALL) C
+    set env(PS1) {PROBE> }
+    foreach directory [list $env(HOME) $env(XDG_CONFIG_HOME) $env(XDG_DATA_HOME) $env(XDG_STATE_HOME) $env(XDG_RUNTIME_DIR) $env(TMUX_TMPDIR) $env(TMPDIR) [file join $env(HOME) retained]] {
+        file mkdir $directory
+        file attributes $directory -permissions 0700
+    }
+    set socket [file join $env(TMUX_TMPDIR) server]
+    set version [exec $tmux -V]
+    check {$version eq "tmux 3.7c"} "requires real tmux 3.7c on PATH, found: $version"
+    puts "EXPERIMENTAL native viewer probe: $version ($tmux)"
+    puts "Private fixture: $root"
+    foreach session {alpha beta retained} {
+        tm new-session -d -s $session -x 120 -y 40 -c $env(HOME) $shell --noprofile --norc -i
+    }
+    tm set-option -g default-shell $shell
+    tm set-option -g mouse on
+    tm set-option -g status-position top
+    tm set-option -g status-interval 1
+    tm set-option -g escape-time 100
+    tm set-option -t retained status off
+    tm set-option -t retained destroy-unattached off
+    set retained [tm display-message -p -t retained: {#{session_id}}]
+    set shell_pane [tm display-message -p -t retained: {#{pane_id}}]
+    set shell_pid [tm display-message -p -t $shell_pane {#{pane_pid}}]
+    set alpha [tm display-message -p -t alpha: {#{pane_id}}]
+    set beta [tm display-message -p -t beta: {#{pane_id}}]
+    set beta_session [tm display-message -p -t beta: {#{session_id}}]
+    set main_pids [list [tm display-message -p -t $alpha {#{pane_pid}}] [tm display-message -p -t $beta {#{pane_pid}}]]
+    tm set-option -g {status-format[0]} "#\[range=session|$beta_session\] BETA #\[norange\] #\[range=left\] BACK #\[norange\]"
+    set default_mouse [status_binding]
+    check {[string first {switch-client -t =} $default_mouse] >= 0} "unexpected default session-range binding: $default_mouse"
+    puts "Fixture default status binding: $default_mouse"
+    # Instrument ONLY this empty-config fixture. No forwarding or key wrappers.
+    tm set-option -g @custom_clicks 0
+    tm set-option -g @prefix_count 0
+    tm bind-key -T root MouseDown1StatusLeft {set-option -gF @custom_clicks '#{e|+:#{@custom_clicks},1}' ; set-option -gF @mouse_target '#{client_name}|#{mouse_status_range}|#{mouse_status_line}' ; switch-client -t alpha}
+    tm bind-key -T prefix F12 {set-option -gF @prefix_target '#{pane_id}|#{session_name}|#{client_name}' ; set-option -gF @prefix_count '#{e|+:#{@prefix_count},1}'}
+    set fixture_bindings [tm list-keys]
+
+    spawn -noecho $tmux -S $socket -f /dev/null attach-session -t alpha
+    set client $spawn_id
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {expr {[tm list-clients -F {#{session_name}}] eq "alpha"}} "outer attached PTY"
+    set outer [tm list-clients -F {#{client_name}}]
+    eventually {expr {[tm display-message -p -t $alpha {#{pane_width}|#{pane_height}}] eq "120|39"}} "outer PTY size"
+    # Count actual transitions, filtered to the outer client;
+    # nested attach/detach must not be attributed to status clicks.
+    tm set-option -g @session_changes 0
+    tm set-hook -g client-session-changed "set-option -gF @last_hook '#{hook_client}|#{client_name}|#{hook_session_name}|#{session_name}'; if-shell -F '#{==:#{hook_client},$outer}' { set-option -gF @session_changes '#{e|+:#{@session_changes},1}' }"
+
+    set first [float_viewer $alpha]
+    type {probe_state=kept_unexported; cd "$HOME/retained"; printf '%s|%s|%s' "$$" "$probe_state" "$PWD" > "$HOME/state-1"; printf 'PROBE_READY_%s\n' 1}
+    type "\r"
+    set expected "$shell_pid|kept_unexported|$env(HOME)/retained"
+    eventually {state_is [file join $env(HOME) state-1] $expected} "initial shell PID, unexported state and cwd"
+    eventually {contains $first PROBE_READY_1} "retained shell rendered through first viewer"
+    check {[tm display-message -p -t alpha: {#{pane_id}}] eq $first} "float not active before status click"
+    click 3 beta 1
+    check {[tm display-message -p -t $retained {#{session_attached}}] == 1} "status click switched the nested client"
+
+    tm kill-pane -t $first
+    eventually {expr {[tm display-message -p -t $retained {#{session_attached}}] == 0}} "hide destroyed only viewer"
+    check {[lsearch -exact [split [tm list-panes -a -F {#{pane_id}}] \n] $first] < 0} "first viewer survived hide"
+    check {[tm display-message -p -t $shell_pane {#{pane_pid}|#{pane_dead}}] eq "$shell_pid|0"} "hide killed retained shell"
+    puts "PASS hide: viewer=$first destroyed; retained=$retained pane=$shell_pane pid=$shell_pid alive and detached"
+
+    set second [float_viewer $beta]
+    check {$second ne $first} "viewer was not recreated"
+    type {printf '%s|%s|%s' "$$" "$probe_state" "$PWD" > "$HOME/state-2"; printf 'PROBE_READY_%s\n' 2}
+    type "\r"
+    eventually {state_is [file join $env(HOME) state-2] $expected} "same shell PID, unexported state and cwd after recreate"
+    eventually {contains $second PROBE_READY_2} "retained shell rendered through recreated viewer"
+    puts "PASS recreate: viewer=$second retained=$retained pane=$shell_pane pid=$shell_pid; unexported state and cwd unchanged"
+
+    # Actual default prefix C-b then F12, not a CLI command with a chosen target.
+    check {[tm display-message -p -t beta: {#{pane_id}}] eq $second} "float not active before prefix"
+    type "\002\033\[24~"
+    eventually {expr {[tm show-options -gqv @prefix_count] eq "1"}} "fixture prefix binding executed"
+    set prefix_target [tm show-options -gqv @prefix_target]
+    check {$prefix_target eq "$second|beta|$outer"} "prefix attribution differs from native outer float targeting: $prefix_target"
+    check {$second ne $beta && $second ne $shell_pane} "prefix target is not distinct from main and retained shell"
+    puts "EXPECTED PRODUCTION GATE FAILURE: C-b F12 target=$prefix_target; main=$beta; retained-shell=$shell_pane. Outer tmux intercepts prefix and targets its active float, NOT the main pane."
+
+    click 10 alpha 2
+    check {[tm show-options -gqv @custom_clicks] eq "1"} "custom mouse binding did not execute exactly once"
+    check {[tm show-options -gqv @mouse_target] eq "$outer|left|0"} "custom click not attributed to outer top status: [tm show-options -gqv @mouse_target]"
+    puts "PASS custom mouse attribution: [tm show-options -gqv @mouse_target]; invocations=1"
+    check {[tm show-options -gqv @prefix_count] eq "1"} "prefix executed more than once"
+    check {[tm display-message -p -t $retained {#{session_attached}}] == 1} "custom click moved nested client"
+    # Return to the same live viewer to ask the shell, rather than trusting a
+    # stale state file. This CLI session switch is outside the two click counts.
+    tm switch-client -c $outer -t beta
+    eventually {expr {[client_session $outer] eq "beta"}} "return for final shell check"
+    type {printf '%s|%s|%s' "$$" "$probe_state" "$PWD" > "$HOME/state-3"}
+    type "\r"
+    eventually {state_is [file join $env(HOME) state-3] $expected} "shell unchanged after custom click and prefix"
+    tm kill-pane -t $second
+    eventually {expr {[tm display-message -p -t $retained {#{session_attached}}] == 0}} "second viewer destroyed"
+    check {[lsearch -exact [split [tm list-panes -a -F {#{pane_id}}] \n] $second] < 0} "second viewer survived hide"
+    check {[tm display-message -p -t $shell_pane {#{pane_pid}|#{pane_dead}}] eq "$shell_pid|0"} "second hide killed shell"
+    check {[list [tm display-message -p -t $alpha {#{pane_pid}}] [tm display-message -p -t $beta {#{pane_pid}}]] eq $main_pids} "main shells replaced"
+    check {[status_binding] eq $default_mouse} "default session-range binding changed"
+    check {[tm list-keys] eq $fixture_bindings} "bindings changed during probe"
+    puts "PASS final shell state/PID/cwd and main PIDs unchanged; fixture bindings unchanged"
+} message options]
+if {$failed && $socket ne "" && [file exists $socket]} {
+    catch {puts stderr "Clients: [tm list-clients -F {#{client_name}|#{session_name}|#{pane_id}|#{client_width}x#{client_height}}]"}
+    catch {puts stderr "Changes: [tm show-options -gqv @session_changes]; last hook: [tm show-options -gqv @last_hook]"}
+    catch {puts stderr "Status: [tm show-options -gv status-format]"}
+}
+teardown
+check {$root eq "" || ![file exists $root]} "private directory survived cleanup"
+if {$failed} {
+    puts stderr "FAIL experimental native pane probe: $message"
+    puts stderr [dict get $options -errorinfo]
+    exit 1
+}
+puts "PASS experimental observations ONLY; production gate FAIL (prefix target); multi-client visibility UNSUPPORTED; NOT SHIPPING"

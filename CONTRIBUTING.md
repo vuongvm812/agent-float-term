@@ -8,7 +8,7 @@ bugs and focused feature proposals. For vulnerabilities, follow
 
 Build with Rust **1.84.1**, edition **2021**. Runtime and PTY tests require
 **tmux 3.4+**; tests also require **Expect**, a C compiler (`cc`), **bash**, and
-**zsh**. Packaging checks also use **Python 3.9+** and **Ruby**. Linux tests need
+**zsh**, and **Neovim**. Packaging checks also use **Python 3.9+** and **Ruby**. Linux tests need
 procps, including an external `/bin/kill`, not just a
 shell builtin. Install these dependencies in your chosen development or
 disposable test environment. CI installs them on its own runners. Do not change
@@ -28,6 +28,7 @@ expect tests/theme_smoke.exp target/debug/agent-float-term
 cargo +1.84.1 build --locked --release
 expect tests/external_smoke.exp target/release/agent-float-term
 python3 -B -m unittest discover -s scripts -p 'test_release*.py'
+python3 -B -m unittest discover -s scripts -p 'test_install_local.py'
 ruby scripts/test-homebrew-formula.rb target/release/agent-float-term
 # In a clean checkout of the source intended for packaging:
 bash scripts/verify-cargo-package.sh
@@ -59,11 +60,35 @@ confirmed `make release` to test the tooling: it publishes releases and commits/
 pushes the tap formula. Use the offline tests and `make release DRY_RUN=1`; the
 latter is a local plan only, not a remote preflight. See [publishing](docs/publishing.md#make-release).
 
+Likewise, `make install` performs a real user-local install. Test its orchestration
+with `test_install_local.py` (fake build/install tools and temporary homes), or use
+`make install DRY_RUN=1`. Do not run the live install target merely to test it.
+
 All five required Expect entry points accept the binary as their first argument.
 Each test owns creation and teardown of its isolated environment and must fail
 on assertions or timeouts instead of silently skipping missing dependencies.
 CI gives each smoke step a separate five-minute timeout and
 `TERM=xterm-256color` to catch hangs consistently.
+
+`tests/pty_smoke.exp` runs both the named process fixture and real Neovim from the
+original PATH. The real editor uses private configuration, four splits, explicit
+navigation mappings, no plugins, and no shada/swap files. Its event log verifies
+exact key delivery and retained window/process identity, not just screen text.
+Keep coverage for conflicting root bindings/prefixes, rapid main handoff, failed
+inspection, and suspended/exited editors without modifying real editor config.
+
+The optional `expect tests/native_pane_probe.exp` requires tmux 3.7c and no app
+binary. It intentionally demonstrates a **failed production routing gate** while
+verifying native status clicks and shell retention. It is not one of the five
+shipping smoke suites. See [the prototype](docs/native-pane-prototype.md).
+
+`tests/mouse_smoke.exp BINARY patched|stock` additionally verifies popup status
+clicks, not native panes. It requires the reference tmux 3.7c on PATH and checks the
+requested server capability rather than skipping mismatches. The Linux reference
+CI lane builds the optional patch in runner temporary storage, runs both mouse
+modes, and reruns keyboard/Neovim coverage against the patched server. See
+[status-bar mouse switching](docs/status-bar-mouse.md) for the isolated builder;
+never replace a developer's tmux or restart a live server as part of these tests.
 
 `tests/autostart_smoke.exp` installs the actual supplied binary under private
 HOME/XDG paths and exercises its generated Zsh template. It checks command,

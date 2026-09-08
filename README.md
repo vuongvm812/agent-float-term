@@ -69,6 +69,11 @@ cargo +1.84.1 build --locked --release
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+To build/install the managed application **and patched tmux for status-bar
+clicking**, use `make install` instead. `make install DRY_RUN=1` previews the plan.
+It does not restart tmux; follow the printed separate-server launch command.
+See [patched-server setup](docs/status-bar-mouse.md).
+
 ### Activate
 
 Ensure the selected binary directory is on `PATH`: Homebrew's `bin`, Cargo's
@@ -88,6 +93,12 @@ the AI terminates its float and terminal jobs**. The next AI run starts fresh.
 Tmux shortcuts operate on the main terminal. Switching away leaves the float in
 its original AI pane; returning restores it unless you explicitly hid it with F7.
 Prompts and choosers temporarily take keyboard focus from the float.
+In the next release, `Ctrl+h/j/k/l` remain available to foreground Neovim inside
+the float; other tmux shortcuts still target main. The optional
+[patched tmux server](docs/status-bar-mouse.md) dismisses the float and switches
+sessions with one status-bar click; stock tmux requires hiding the popup first.
+See [input behavior](docs/operations.md#lifetime-and-ownership)
+for details and limitations.
 
 Fresh installation edits no startup files unless explicitly selected. Review key
 conflicts before using `bind --replace-key`. Outside tmux, `agent-float-term start`

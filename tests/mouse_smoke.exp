@@ -1,0 +1,383 @@
+#!/usr/bin/env expect
+# Run from any directory; select the server executable using PATH.
+# expect tests/mouse_smoke.exp /path/to/agent-float-term patched|stock
+# Interactive input always traverses real attached PTYs, never send-keys.
+set timeout 5
+log_user 0
+if {$argc != 2 || [lindex $argv 1] ni {patched stock}} {
+    puts stderr "usage: expect tests/mouse_smoke.exp BINARY patched|stock"
+    exit 1
+}
+set source_binary [file normalize [lindex $argv 0]]
+set mode [lindex $argv 1]
+set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
+foreach tool {tmux bash cc mktemp} {
+    if {[auto_execok $tool] eq ""} { puts stderr "mouse smoke requires $tool"; exit 1 }
+}
+set tmux [file normalize [lindex [auto_execok tmux] 0]]
+# file normalize does not resolve a symlink in the final path component.
+while {[file type $tmux] eq "link"} {
+    set tmux [file normalize [file join [file dirname $tmux] [file readlink $tmux]]]
+}
+set shell [file normalize [lindex [auto_execok bash] 0]]
+set root ""
+set socket ""
+set client ""
+set viewers {}
+set watchdog ""
+set output ""
+set deadline [expr {[clock milliseconds] + 60000}]
+
+proc check {condition message} {
+    if {![uplevel 1 [list expr $condition]]} { error $message }
+}
+proc tm {args} {
+    global tmux socket deadline
+    check {[clock milliseconds] < $deadline} "overall 60s deadline exceeded"
+    return [exec $tmux -S $socket -f /dev/null {*}$args]
+}
+proc drain {} {
+    global viewers client output
+    foreach viewer $viewers {
+        expect -i $viewer -timeout 0 -re {.+} {
+            if {$viewer eq $client} { append output $expect_out(0,string) }
+        } timeout {} eof {error "attached PTY client exited"}
+    }
+}
+proc eventually {script message} {
+    global deadline
+    set until [expr {min($deadline, [clock milliseconds] + 5000)}]
+    while {[clock milliseconds] < $until} {
+        drain
+        if {[uplevel 1 $script]} { return }
+        after 25
+    }
+    error "timed out: $message"
+}
+proc settle {{milliseconds 350}} {
+    global deadline
+    set until [expr {[clock milliseconds] + $milliseconds}]
+    while {[clock milliseconds] < $until} {
+        check {[clock milliseconds] < $deadline} "overall 60s deadline exceeded"
+        drain
+        after 25
+    }
+}
+proc type {text} { global client; send -i $client -- $text }
+proc f7 {} { type "\033\[18~" }
+proc click {x y} { type "\033\[<0;${x};${y}M\033\[<0;${x};${y}m" }
+proc client_session {name} {
+    foreach line [split [tm list-clients -F {#{client_name}|#{session_name}}] \n] {
+        lassign [split $line |] actual session
+        if {$actual eq $name} { return $session }
+    }
+    return ""
+}
+proc float_for {owner} {
+    set found {}
+    foreach line [split [tm list-panes -a -F {#{pane_id}|#{@aft_owner}}] \n] {
+        lassign [split $line |] pane parent
+        if {$parent eq $owner} { lappend found $pane }
+    }
+    check {[llength $found] <= 1} "duplicate retained floats for $owner"
+    return [lindex $found 0]
+}
+proc attached {} {
+    global float
+    return [tm display-message -p -t $float {#{session_attached}}]
+}
+proc contains {pane text} {
+    return [expr {[string first $text [tm capture-pane -p -t $pane]] >= 0}]
+}
+proc status_binding {} {
+    foreach line [split [tm list-keys -T root] \n] {
+        if {[regexp {^bind-key +(?:-r +)?-T +root +MouseDown1Status +} $line]} { return $line }
+    }
+    error "default MouseDown1Status binding missing"
+}
+proc state_is {path expected} {
+    if {![file exists $path]} { return 0 }
+    set input [open $path r]
+    set actual [read $input]
+    close $input
+    return [expr {$actual eq $expected}]
+}
+proc shell_state {number {initialize 0}} {
+    global root float float_pid env
+    if {$initialize} { type {mouse_state=kept_unexported; cd "$HOME/retained"; } }
+    type "printf '%s|%s|%s' \"\$\$\" \"\$mouse_state\" \"\$PWD\" > '$root/state-$number'\r"
+    eventually [list state_is "$root/state-$number" "$float_pid|kept_unexported|$env(HOME)/retained"] \
+        "same shell PID, unexported variable and cwd (sample $number)"
+    check {[tm display-message -p -t $float {#{pane_pid}|#{pane_dead}}] eq "$float_pid|0"} "retained shell replaced or dead"
+}
+proc bindings {{restore_table ""} {restore_key ""}} {
+    global user_tables instance
+    set result {}
+    foreach table $user_tables {
+        foreach line [split [tm list-keys -T $table] \n] {
+            check {[regexp {^bind-key +(.*?) *-T +([^ ]+) +([^ ]+) +(.*)$} $line ignored flags actual key body]} "unparseable binding: $line"
+            if {$actual eq $restore_table && $key eq $restore_key} {
+                check {[regexp {^User[0-9]+$} $key] && [string first "AFT_RESTORE_INSTANCE=$instance" $body] >= 0} "excluded key is not the owned restore binding"
+                continue
+            }
+            lappend result [list [string trim $flags] $actual $key $body]
+        }
+    }
+    return [lsort $result]
+}
+proc unchanged {} {
+    global baseline float
+    set table [tm show-options -qv -t $float @aft_restore_table]
+    set key [tm show-options -qv -t $float @aft_restore_key]
+    check {$table ne "" && $key ne ""} "missing owned restore-key identity"
+    check {[bindings $table $key] eq $baseline} "existing user bindings were wrapped or changed"
+}
+proc no_handoff {input label} {
+    global outer observer
+    set changes [tm show-options -gqv @session_changes]
+    set custom [tm show-options -gqv @custom_clicks]
+    type $input
+    settle
+    check {[client_session $outer] eq "alpha" && [attached] == 1} "$label dismissed popup or switched origin"
+    check {[client_session $observer] eq "alpha"} "$label switched observer"
+    check {[tm show-options -gqv @session_changes] eq $changes && [tm show-options -gqv @custom_clicks] eq $custom} "$label invoked a main mouse binding"
+    puts "PASS negative: $label"
+}
+proc switched_once {x y} {
+    global outer observer mode
+    set count [expr {[tm show-options -gqv @session_changes] + 1}]
+    click $x $y
+    eventually {expr {[client_session $outer] eq "beta" && [attached] == 0 && [tm show-options -gqv @session_changes] == $count}} \
+        "status click switches only origin once and dismisses popup"
+    settle
+    check {[client_session $outer] eq "beta" && [tm show-options -gqv @session_changes] == $count} "duplicate press/release transition"
+    check {[client_session $observer] eq "alpha" && [attached] == 0} "observer switched or stole the retained popup"
+    check {[tm show-options -gqv @aft_last_error] eq ""} "$mode mouse close recorded a popup error"
+}
+proc teardown {} {
+    global root socket tmux viewers watchdog
+    if {$watchdog ne ""} {
+        catch {exec kill -TERM [exp_pid -i $watchdog]}
+        catch {close -i $watchdog}
+        catch {wait -i $watchdog}
+        set watchdog ""
+    }
+    if {$socket ne "" && [file exists $socket]} { catch {exec $tmux -S $socket -f /dev/null kill-server} }
+    foreach viewer $viewers { catch {close -i $viewer}; catch {wait -i $viewer} }
+    if {$root ne ""} { file delete -force -- $root }
+}
+trap {puts stderr "FAIL mouse smoke: interrupted or overall 60s deadline"; teardown; exit 1} {SIGINT SIGTERM SIGHUP SIGUSR1}
+
+set failed [catch {
+    set root [file normalize [exec mktemp -d /tmp/aft-mouse.XXXXXXXX]]
+    file attributes $root -permissions 0700
+    set inherited_path $env(PATH)
+    foreach name [array names env] { unset env($name) }
+    set env(PATH) $inherited_path
+    foreach {name directory} {HOME home XDG_CONFIG_HOME config XDG_DATA_HOME data XDG_STATE_HOME state XDG_RUNTIME_DIR runtime XDG_CACHE_HOME cache TMUX_TMPDIR sockets TMPDIR tmp} {
+        set env($name) [file join $root $directory]
+        file mkdir $env($name)
+        file attributes $env($name) -permissions 0700
+    }
+    set env(SHELL) $shell
+    set env(TERM) xterm-256color
+    set env(LC_ALL) C
+    set env(PS1) {MOUSE> }
+    # Independent wall-clock bound also interrupts a blocked exec, not just polls.
+    set seconds [expr {max(1, ($deadline - [clock milliseconds]) / 1000)}]
+    spawn -noecho $shell --noprofile --norc -c {sleep "$2" & timer=$!; trap 'kill "$timer" 2>/dev/null; exit' TERM INT HUP; wait "$timer"; kill -USR1 "$1"} watchdog [pid] $seconds
+    set watchdog $spawn_id
+    file mkdir [file join $root bin] [file join $env(HOME) retained]
+    set socket [file join $env(TMUX_TMPDIR) server]
+    set binary [file join $root bin agent-float-term]
+    file copy $source_binary $binary
+    file attributes $binary -permissions 0700
+    set claude [file join $root bin claude]
+    exec cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
+    # Pin the same actual tmux executable for the application and nested viewer.
+    file link -symbolic [file join $root bin tmux] $tmux
+    set env(PATH) "[file join $root bin]:$inherited_path"
+    set config_dir [file join $env(XDG_CONFIG_HOME) agent-float-term]
+    file mkdir $config_dir
+    set out [open [file join $config_dir config.json] {WRONLY CREAT EXCL} 0600]
+    puts $out [format {{"shortcut":"F7","width":60,"height":60,"shell":"%s","harness_paths":[{"harness":"claude","path":"%s"}]}} \
+        [string map {\\ \\\\ \" \\\"} $shell] [string map {\\ \\\\ \" \\\"} $claude]]
+    close $out
+    foreach session {alpha beta} {
+        tm new-session -d -s $session -x 120 -y 40 -c $env(HOME) $shell --noprofile --norc -i
+    }
+    set capability [tm display-message -p {#{aft_popup_status_mouse}}]
+    check {($mode eq "patched" && $capability eq "1") || ($mode eq "stock" && $capability eq "")} \
+        "explicit $mode mode disagrees with running server capability '$capability'"
+    puts "Mouse smoke: mode=$mode; [exec $tmux -V]; executable=$tmux; private socket=$socket"
+    tm set-option -g default-shell $shell
+    tm set-option -g mouse on
+    tm set-option -g status-position top
+    tm set-option -g status-interval 1
+    tm set-option -g escape-time 100
+    set alpha [tm display-message -p -t alpha: {#{pane_id}}]
+    set beta_session [tm display-message -p -t beta: {#{session_id}}]
+    set main_pids [tm list-panes -a -F {#{pane_pid}}]
+    tm set-option -g {status-format[0]} "#\[range=session|$beta_session\] BETA #\[norange\]"
+    set default_mouse [status_binding]
+    check {[string first {switch-client -t =} $default_mouse] >= 0} "default session-range binding missing: $default_mouse"
+    tm set-option -g @custom_clicks 0
+    tm bind-key -T root MouseDown1StatusLeft {set-option -gF @custom_clicks '#{e|+:#{@custom_clicks},1}' ; set-option -gF @mouse_record '#{client_name}|#{mouse_status_range}|#{mouse_status_line}' ; switch-client -t beta}
+    tm bind-key -T prefix t switch-client -T fixture-modal
+    tm bind-key -T fixture-modal x display-message FIXTURE_UNWRAPPED
+    tm bind-key -T root User17 display-message FIXTURE_USER_KEY
+    tm bind-key -T root F10 display-popup -E -w 60 -h 16 -x C -y C $claude
+    set user_tables {}
+    foreach line [split [tm list-keys] \n] {
+        if {[regexp { -T +([^ ]+) } $line ignored table]} { lappend user_tables $table }
+    }
+    set user_tables [lsort -unique $user_tables]
+    set before_bind [bindings]
+    exec $binary bind --socket $socket
+    set baseline [bindings]
+    set without_f7 {}
+    foreach entry $baseline {
+        if {[lrange $entry 1 2] ne {root F7}} { lappend without_f7 $entry }
+    }
+    check {$without_f7 eq $before_bind} "bind changed a user binding other than installing F7"
+    set doctor [exec $binary doctor --socket $socket]
+    set expected [expr {$mode eq "patched" ? "supported" : "unavailable"}]
+    check {[regexp -line "^Status-bar mouse: ${expected}(?:;| |$)" $doctor]} "doctor did not report $expected: $doctor"
+
+    spawn -noecho $tmux -S $socket -f /dev/null attach-session -t alpha
+    set client $spawn_id
+    lappend viewers $client
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {expr {[tm list-clients -F {#{session_name}}] eq "alpha"}} "origin PTY attached"
+    set outer [tm list-clients -F {#{client_name}}]
+    spawn -noecho $tmux -S $socket -f /dev/null attach-session -t alpha
+    lappend viewers $spawn_id
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {expr {[llength [split [tm list-clients -F {#{client_name}}] \n]] == 2}} "observer PTY attached"
+    foreach name [split [tm list-clients -F {#{client_name}}] \n] { if {$name ne $outer} { set observer $name } }
+    eventually {expr {[tm display-message -p -t $alpha {#{pane_width}|#{pane_height}}] eq "120|39"}} "120x40 terminal with exposed top status"
+    tm set-option -g @session_changes 0
+    tm set-hook -g client-session-changed "if-shell -F '#{==:#{hook_client},$outer}' { set-option -gF @session_changes '#{e|+:#{@session_changes},1}' }"
+
+    # A foreign popup without -M must stay modal even on the patched server.
+    set output ""
+    type "\033\[21~"
+    eventually {expr {[string first "AFT_READY claude" $output] >= 0}} "raw non-M popup ready"
+    click 3 1
+    settle
+    check {[client_session $outer] eq "alpha" && [tm show-options -gqv @session_changes] eq "0"} "raw popup without -M handed off a status click"
+    type q
+    settle
+    click 3 1
+    eventually {expr {[client_session $outer] eq "beta" && [tm show-options -gqv @session_changes] eq "1"}} "raw popup exited and native click works"
+    check {[client_session $observer] eq "alpha"} "raw-popup control switched observer"
+    tm switch-client -c $outer -t alpha
+    settle
+    check {[bindings] eq $baseline} "raw popup changed user bindings"
+    puts "PASS raw popup without -M blocks status click ($mode)"
+
+    type "claude\r"
+    eventually {contains $alpha "AFT_READY claude"} "synthetic AI foreground job ready"
+    f7
+    eventually {expr {[float_for $alpha] ne ""}} "F7 creates application float"
+    set float [float_for $alpha]
+    set float_pid [tm display-message -p -t $float {#{pane_pid}}]
+    set instance [tm show-options -qv -t $float @aft_instance]
+    eventually {expr {[attached] == 1}} "F7 popup viewer attached (stock must not receive unsupported -M)"
+    shell_state 1 1
+    unchanged
+    check {[tm show-options -qv -t $float @aft_origin_name] eq $outer} "popup assigned to observer instead of origin"
+    puts "PASS F7 opens app popup; shell state captured; existing user tables unchanged"
+
+    no_handoff "\033\[<0;2;4M\033\[<0;2;4m" "outside popup, non-status pane click"
+    no_handoff "\033\[<0;60;20M\033\[<0;60;20m" "inside popup click"
+    no_handoff "\033\[<64;3;1M\033\[<65;3;1M" "status wheel up/down"
+    no_handoff "\033\[<32;3;1M\033\[<0;3;1m" "status drag and release"
+    no_handoff "\033\[<0;3;1m" "status release only"
+    tm set-option -g mouse off
+    settle
+    no_handoff "\033\[<0;3;1M\033\[<0;3;1m" "mouse off"
+    tm set-option -g mouse on
+    tm set-option -g status off
+    settle
+    no_handoff "\033\[<0;3;1M\033\[<0;3;1m" "status off"
+    tm set-option -g status on
+    # Discard any literal escape bytes delivered while mouse reporting was off.
+    type "\025"
+    settle
+    if {$mode eq "patched"} {
+        switched_once 3 1
+        check {[status_binding] eq $default_mouse} "default top status binding changed"
+        unchanged
+        tm switch-client -c $outer -t alpha
+        eventually {expr {[attached] == 1}} "return to origin automatically restores float"
+        check {[float_for $alpha] eq $float} "automatic return replaced float"
+        shell_state 2
+        puts "PASS top default session-range click switches origin once; observer unchanged; same float auto-restores"
+    } else {
+        no_handoff "\033\[<0;3;1M\033\[<0;3;1m" "stock app popup status click"
+        f7
+        eventually {expr {[attached] == 0}} "stock F7 hides popup"
+        switched_once 3 1
+        tm switch-client -c $outer -t alpha
+        settle 1500
+        check {[attached] == 0} "stock explicit hide failed to suppress automatic return"
+        f7
+        eventually {expr {[attached] == 1}} "stock manual reopen"
+        shell_state 2
+        puts "PASS stock fallback opens without -M, blocks click until F7 hide, retains shell"
+    }
+
+    tm set-option -g status-position bottom
+    tm set-option -g status 2
+    tm set-option -g {status-format[0]} "#\[range=session|$beta_session\] BETA #\[norange\]"
+    tm set-option -g {status-format[1]} {#[range=left] CUSTOM #[norange]}
+    settle
+    if {$mode eq "stock"} {
+        no_handoff "\033\[<0;3;40M\033\[<0;3;40m" "stock bottom multiline custom range"
+        f7
+        eventually {expr {[attached] == 0}} "hide stock popup for custom binding control"
+    }
+    switched_once 3 40
+    check {[tm show-options -gqv @custom_clicks] eq "1"} "custom binding did not execute exactly once"
+    check {[tm show-options -gqv @mouse_record] eq "$outer|left|1"} "custom mouse client/range/status_line lost: [tm show-options -gqv @mouse_record]"
+    unchanged
+    tm switch-client -c $outer -t alpha
+    if {$mode eq "stock"} {
+        settle 1500
+        check {[attached] == 0} "stock custom control restored explicitly hidden float"
+        f7
+    }
+    eventually {expr {[attached] == 1}} "restore after bottom multiline click"
+    check {[float_for $alpha] eq $float} "bottom click replaced retained float"
+    shell_state 3
+    puts "PASS bottom multiline custom range: client=$outer range=left status_line=1 invocations=1"
+
+    f7
+    eventually {expr {[attached] == 0}} "explicit F7 hide"
+    tm switch-client -c $outer -t beta
+    tm switch-client -c $outer -t alpha
+    settle 1500
+    check {[attached] == 0} "explicit F7 hide did not suppress automatic return"
+    unchanged
+    check {[tm show-options -gqv @aft_last_error] eq ""} "application recorded popup failure"
+    type q
+    eventually {expr {[float_for $alpha] eq ""}} "AI exit removes retained shell"
+    eventually {expr {[catch {exec kill -0 $float_pid 2>@1}]}} "retained shell process exits"
+    check {[tm list-panes -a -F {#{pane_pid}}] eq $main_pids} "AI cleanup replaced main shells or leaked a pane"
+    check {[client_session $observer] eq "alpha"} "observer moved during lifecycle checks"
+    check {[bindings] eq $baseline} "AI cleanup failed to restore original user tables"
+    puts "PASS explicit hide suppresses return; AI exit cleans shell and owned restore key; no popup error"
+} message options]
+if {$failed && $socket ne "" && [file exists $socket]} {
+    catch {puts stderr "Clients: [tm list-clients -F {#{client_name}|#{session_name}|#{pane_id}}]"}
+    catch {puts stderr "Popup error: [tm show-options -gqv @aft_last_error]"}
+}
+teardown
+check {$root eq "" || ![file exists $root]} "private directory survived cleanup"
+if {$failed} {
+    puts stderr "FAIL $mode mouse smoke: $message"
+    puts stderr [dict get $options -errorinfo]
+    exit 1
+}
+puts "PASS $mode mouse smoke (private server and directory removed)"

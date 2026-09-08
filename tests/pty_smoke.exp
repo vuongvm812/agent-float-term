@@ -10,7 +10,7 @@ if {$argc != 1} {
 }
 set source_binary [file normalize [lindex $argv 0]]
 set fixture [file join [file dirname [file normalize [info script]]] fixtures terminal.c]
-foreach tool {tmux cc bash} {
+foreach tool {tmux cc bash nvim} {
     if {[auto_execok $tool] eq ""} {
         puts stderr "PTY smoke test requires $tool"
         exit 1
@@ -18,6 +18,7 @@ foreach tool {tmux cc bash} {
 }
 set tmux [lindex [auto_execok tmux] 0]
 set shell [lindex [auto_execok bash] 0]
+set real_nvim [file normalize [lindex [auto_execok nvim] 0]]
 set root ""
 set socket ""
 set client ""
@@ -52,6 +53,13 @@ proc contains {pane text} {
 }
 proc clients {} {
     return [llength [split [string trim [tm list-clients -F {#{client_pid}}]]]]
+}
+proc client_position {name} {
+    foreach line [split [tm list-clients -F {#{client_name}|#{pane_id}|#{window_id}}] \n] {
+        lassign [split $line |] actual pane window
+        if {$actual eq $name} { return [list $pane $window] }
+    }
+    error "client disappeared: $name"
 }
 proc type {text} {
     global client
@@ -114,6 +122,16 @@ proc write_private {path contents} {
     set out [open $path {WRONLY CREAT TRUNC} 0600]
     puts $out $contents
     close $out
+}
+proc editor_records {} {
+    global root
+    set path [file join $root editor-events]
+    if {![file exists $path]} { return {} }
+    set input [open $path r]
+    set contents [string trim [read $input]]
+    close $input
+    if {$contents eq ""} { return {} }
+    return [split $contents \n]
 }
 proc teardown {} {
     global root socket client extra_clients tmux
@@ -367,6 +385,118 @@ if {!$failed} {
         f7
         eventually {expr {[clients] == 1}} "hide after editor exit"
 
+        # Real Neovim, isolated from personal config/plugins. All four root keys
+        # deliberately conflict: a regression would create a MAIN window.
+        foreach key {C-h C-j C-k C-l} {
+            tm bind-key -n $key new-window -n "navigation-$key"
+        }
+        set navigation_bindings [tm list-keys -T root]
+        write_private [file join $root editor.vim] {
+set noswapfile noundofile nobackup nowritebackup
+function! AftRecord()
+  call writefile([printf('%d|%d|%d', win_getid(), winnr('$'), getpid())], $HOME . '/../editor-events', 'a')
+endfunction
+nnoremap <silent> <C-h> <C-w>h:call AftRecord()<CR>
+nnoremap <silent> <C-j> <C-w>j:call AftRecord()<CR>
+nnoremap <silent> <C-k> <C-w>k:call AftRecord()<CR>
+nnoremap <silent> <C-l> <C-w>l:call AftRecord()<CR>
+autocmd VimEnter * vsplit | split | wincmd l | split | wincmd t | call AftRecord()
+}
+        f7
+        eventually {expr {[clients] == 2}} "open for real Neovim"
+        # The executable path was resolved before installing the fake nvim fixture.
+        type "'$real_nvim' -u '$root/editor.vim' -i NONE --noplugin -n\r"
+        eventually {expr {[llength [editor_records]] == 1}} "real Neovim four-split fixture ready"
+        set initial_editor [lindex [editor_records] 0]
+        check {[lindex [split $initial_editor |] 1] == 4} "Neovim did not create four splits"
+        set editor_windows {}
+        foreach key [list "\014" "\012" "\010" "\013"] {
+            lappend editor_windows [lindex [split [lindex [editor_records] end] |] 0]
+            set count [llength [editor_records]]
+            type $key
+            eventually {expr {[llength [editor_records]] == $count + 1}} "Neovim navigation delivered exactly once"
+            check {[clients] == 2} "editor navigation hid the float"
+            check {[lindex [client_position $origin_client] 0] eq $outer} "editor navigation changed main focus"
+        }
+        check {[llength [lsort -unique $editor_windows]] == 4} "navigation did not visit all four editor splits"
+        check {[lindex [editor_records] end] eq $initial_editor} "navigation did not return to initial split/process"
+        type "\014\012\010\013\014\012\010\013"
+        eventually {expr {[llength [editor_records]] == 13}} "rapid editor navigation not lost or duplicated"
+        check {[lindex [editor_records] end] eq $initial_editor} "rapid navigation reordered"
+        # Nonconflicting native editor keys must also pass through unchanged.
+        type "\027l:call AftRecord()\r"
+        eventually {expr {[llength [editor_records]] == 14}} "native Ctrl+w split navigation"
+        check {[lindex [editor_records] end] ne $initial_editor} "native editor navigation did not change focus"
+        type "\010"
+        eventually {expr {[llength [editor_records]] == 15}} "return to initial editor split"
+        check {[lindex [editor_records] end] eq $initial_editor} "editor failed to return left"
+        foreach shortcut [list "\002c" "\001c" "\033n" "\002tc"] {
+            type $shortcut
+            eventually {expr {[clients] == 1 && [lindex [client_position $origin_client] 1] ne $origin_window}} "dedicated tmux shortcut selects a main window"
+            check {[llength [split [tm list-windows -t $float_session -F {#{window_id}}] \n]] == 1} "tmux shortcut changed inner topology"
+            tm select-window -t $origin_window
+            eventually {expr {[clients] == 2}} "restore same real Neovim after main shortcut"
+        }
+        f7
+        eventually {expr {[clients] == 1}} "F7 hides real Neovim"
+        f7
+        eventually {expr {[clients] == 2}} "F7 restores real Neovim"
+        type ":call AftRecord()\r"
+        eventually {expr {[llength [editor_records]] == 16}} "real editor survived hide and main navigation"
+        check {[lindex [editor_records] end] eq $initial_editor} "editor state changed across hide/restore"
+        set windows_before [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]]
+        type "\033n\014"
+        eventually {expr {[clients] == 1 && [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]] == $windows_before + 2}} "navigation queued after main shortcut also goes to main"
+        check {[llength [editor_records]] == 16} "queued main navigation leaked into Neovim"
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore after rapid main handoff"
+        type "\032"
+        eventually {contains $float Stopped} "real Neovim suspended to shell"
+        type "\014"
+        eventually {expr {[clients] == 1 && [lindex [client_position $origin_client] 1] ne $origin_window}} "stopped Neovim does not intercept shell navigation"
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore shell with stopped editor"
+        type "fg\r"
+        eventually {expr {[tm display-message -p -t $float {#{pane_current_command}}] eq "nvim"}} "real editor resumed"
+        type "\014"
+        eventually {expr {[llength [editor_records]] == 17}} "resumed editor receives navigation"
+        # A temporarily unavailable probe must not redirect application input.
+        file rename $binary "$binary.offline"
+        type "\010"
+        eventually {expr {[llength [editor_records]] == 18}} "failed inspection helper keeps navigation local"
+        file rename "$binary.offline" $binary
+        check {[clients] == 2} "failed helper routed navigation to main"
+        # Even a shared prefix must yield to editor navigation, then regain its
+        # native meaning outside the editor. Only this fixture's options change.
+        f7
+        eventually {expr {[clients] == 1}} "hide before shared-prefix test"
+        tm set-option -t $origin_session prefix C-h
+        f7
+        eventually {expr {[clients] == 2}} "reopen with shared navigation prefix"
+        type "\010"
+        eventually {expr {[llength [editor_records]] == 19}} "Neovim navigation wins over shared prefix"
+        type ":qa!\r"
+        eventually {expr {[tm display-message -p -t $float {#{pane_current_command}}] ne "nvim"}} "real editor exited"
+        type "\010c"
+        eventually {expr {[clients] == 1 && [lindex [client_position $origin_client] 1] ne $origin_window}} "shared prefix works on main outside Neovim"
+        tm set-option -t $origin_session prefix C-b
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore with original prefix"
+        foreach key [list "\010" "\012" "\013" "\014"] {
+            type $key
+            eventually {expr {[clients] == 1 && [lindex [client_position $origin_client] 1] ne $origin_window}} "shell navigation routes to main after editor exits"
+            tm select-window -t $origin_window
+            eventually {expr {[clients] == 2}} "restore shell after navigation"
+        }
+        check {[tm list-keys -T root] eq $navigation_bindings} "Neovim integration changed user root bindings"
+        check {[screen $outer] eq $outer_before} "real editor input leaked to main AI"
+        f7
+        eventually {expr {[clients] == 1}} "hide after real editor tests"
+        foreach key {C-h C-j C-k C-l} { tm unbind-key -n $key }
+        foreach window [split [tm list-windows -t $origin_session -F {#{window_id}}] \n] {
+            if {$window ne $origin_window} { tm kill-window -t $window }
+        }
+
         # Exiting must close the inner client even if the user's global setting
         # would otherwise switch it into the live AI session.
         tm set-option -g detach-on-destroy off
@@ -603,4 +733,4 @@ if {$failed} {
 }
 teardown
 if {$failed} { exit 1 }
-puts "PTY smoke passed: invocation reset, visible/hidden exit and jobs, main shortcuts/custom tables, session restoration, prompt protection, F7 hiding, scope, persistence, contention, legacy cleanup, binding ownership"
+puts "PTY smoke passed: real Neovim navigation/suspend/resume, queued main handoff, invocation reset, visible/hidden exit and jobs, main shortcuts/custom tables, session restoration, prompt protection, F7 hiding, scope, persistence, contention, legacy cleanup, binding ownership"

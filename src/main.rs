@@ -100,6 +100,14 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
+    /// Exit successfully only when navigation may leave the floating application.
+    #[command(hide = true)]
+    NavigationToMain {
+        #[arg(long)]
+        pane_pid: u32,
+        #[arg(long)]
+        pane_tty: PathBuf,
+    },
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -143,6 +151,13 @@ fn run(cli: Cli) -> Result<()> {
             session,
             instance,
         } => tmux::watch(socket, session, instance),
+        Command::NavigationToMain { pane_pid, pane_tty } => {
+            anyhow::ensure!(
+                !agent_float_term::inspect::foreground_nvim(pane_pid, &pane_tty)?,
+                "navigation belongs to Neovim"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -178,6 +193,7 @@ mod tests {
         Cli::command().debug_assert();
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("dispatch"));
+        assert!(!help.contains("navigation-to-main"));
         assert!(help.contains("Preview a user-local install"));
         assert!(Cli::try_parse_from(["aft", "start"]).is_ok());
         assert!(Cli::try_parse_from(["aft", "start", "claude"]).is_err());

@@ -1,8 +1,9 @@
 # Compatibility And Validation
 
-**Current status: coordinated release and Homebrew first-use changes locally tested.**
+**Current status: Neovim navigation and optional popup status-mouse patch locally tested.**
 The runtime minimum is **3.4**. Each float belongs to one AI invocation and is
-reset when it exits. Tmux keyboard shortcuts target the main terminal.
+reset when it exits. Tmux keyboard shortcuts target the main terminal, except
+`Ctrl+h/j/k/l` remain with foreground Neovim inside the float.
 Returning to the original AI pane restores a
 temporarily hidden float; explicit F7 hide disables restoration until reopened.
 Current evidence is separate from the historical results below.
@@ -15,9 +16,12 @@ establish acceptance of new runtime changes or a completed remote matrix.
 
 | Change | Evidence | Still Needed |
 | --- | --- | --- |
-| Configuration, installer, and Rust APIs | 89 macOS ARM64 tests and Clippy passed; current Linux ARM64 test-target cross-check passed; 83 non-root Debian 12 ARM64 tests passed before first-use changes | Current Linux runtime and remote CI acceptance |
+| Configuration, installer, and Rust APIs | 90 macOS ARM64 tests and Clippy passed; current Linux ARM64 test-target cross-check passed; 83 non-root Debian 12 ARM64 tests passed before first-use changes | Current Linux runtime and remote CI acceptance |
 | Generated integration layout | Fresh install, Bash/Zsh migration, no-write preview, idempotency, byte/mode preservation, collision/edited-file refusal, and migrated uninstall passed; all four release smoke suites passed | Broader Linux runtime migration coverage |
-| JSON-based smoke fixtures | All five current release smoke suites passed on macOS tmux 3.7c; extracted ARM64 archive acceptance and 3.4/3.5a coverage predate first-use changes | Updated archive acceptance and latency benchmark |
+| JSON-based smoke fixtures | All five current suites passed on macOS tmux 3.7c: core PTY and package upgrade used release builds; startup/autostart/theme used debug. Current core PTY also passed on 3.5a (debug) | Updated archive acceptance, Linux runtime, minimum 3.4 rerun, and latency benchmark |
+| Neovim navigation | Real Neovim 0.11.0 with four splits and isolated mappings; all four keys, rapid sequences, root/prefix/prefix2/custom-table main routing, queued handoff, shared navigation prefix, suspend/resume, failed helper, unchanged bindings, and retained state passed | Linux/remote CI runtime, other editor versions, and personal navigation-plugin behavior |
+| Native-pane mouse experiment | Isolated tmux 3.7c probe passed actual SGR status session clicks and retained-shell checks; prefix command demonstrably targeted the viewer instead of main | **Not shipping:** main-shortcut parity without user-binding wrappers and multi-client ownership remain blocked; see [prototype](native-pane-prototype.md) |
+| Popup status-mouse extension | Pinned tmux 3.7c patch built on macOS ARM64; stock/patched PTY tests passed top/default and bottom/multiline/custom status clicks, observer isolation, preserved shell/restoration, negative events, unchanged bindings, and clean AI exit | Requires a patched **server**, not just an application/client update; Linux CI and live status-plugin deployment pending; see [setup](status-bar-mouse.md) |
 | Package-owned executable upgrades | Current first-bind/start and upgrade PTY passed on macOS 3.7c; prior non-root Debian 12 ARM64 3.4 debug upgrade test passed; realistic 0775 package groups, removed old keg, original watcher and shell state, stable root/restore bindings | Linux first-use runtime, real Homebrew upgrade acceptance, and remaining native targets |
 | Coordinated publication | 60 offline release-tool tests, local Make dry run, and workflow lint passed; altered assets are refused even when their current checksums/formula agree, unless they match immutable build evidence | Real Actions evidence upload/download and confirmed publication; no live mutation tests were run |
 | Cargo distribution | Upload file list inspected; publish dry-run built the unpacked crate and aborted upload as expected; actual Cargo install/uninstall from unpacked crate passed with isolated root and integration-only setup | Clean tagged-source remote gate and installation from published crates.io version |

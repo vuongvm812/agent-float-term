@@ -273,6 +273,50 @@ pub(super) fn prepare(
             ))
         ));
     }
+    // Inspect the retained shell, not the nested viewer process. Only a positive
+    // non-editor result may yield to main; unavailable metadata keeps input local.
+    let process = tmux.output(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{pane_pid}|#{pane_tty}",
+    ])?;
+    let (pid, tty) = process
+        .split_once('|')
+        .context("missing float terminal identity")?;
+    let pid: u32 = pid.parse().context("invalid float process PID")?;
+    let predicate = literal_format(&format!(
+        "{} navigation-to-main --pane-pid {pid} --pane-tty {} >/dev/null 2>&1",
+        shell_quote(text(&helper_path()?)?),
+        shell_quote(tty)
+    ));
+    for key in ["C-h", "C-j", "C-k", "C-l"] {
+        let fallback = if let Some(index) = fields[..2].iter().position(|prefix| *prefix == key) {
+            format!("switch-client -T {prefix_table}-{index}")
+        } else if keys
+            .iter()
+            .any(|(source, bound)| source == fields[2] && bound == key)
+        {
+            route(None)
+        } else {
+            otherwise.clone()
+        };
+        let navigation = format!(
+            "if-shell {} {} send-keys",
+            tmux_quote(&predicate),
+            tmux_quote(&fallback)
+        );
+        let body = format!(
+            "if-shell -F '#{{==:#{{@aft_routing}},1}}' {} {}",
+            tmux_quote(&format!("send-keys -K -c {quoted_client}")),
+            tmux_quote(&navigation)
+        );
+        commands.push_str(&format!(
+            "bind-key -T {table} {key} {}\n",
+            tmux_quote(&body)
+        ));
+    }
     commands.push_str(&format!(
         "bind-key -T {table} {} {}\n",
         tmux_quote(&config.key),

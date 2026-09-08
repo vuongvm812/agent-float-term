@@ -1,0 +1,63 @@
+--- a/cmd-display-menu.c
++++ b/cmd-display-menu.c
+@@ -57,2 +57,2 @@
+-	.args = { "Bb:Cc:d:e:Eh:kNs:S:t:T:w:x:y:", 0, -1, NULL },
+-	.usage = "[-BCEkN] [-b border-lines] [-c target-client] "
++	.args = { "Bb:Cc:d:e:Eh:kMNs:S:t:T:w:x:y:", 0, -1, NULL },
++	.usage = "[-BCEkMN] [-b border-lines] [-c target-client] "
+@@ -501,6 +501,11 @@
+ 	if (args_has(args, 'k')) {
+ 		if (flags == -1)
+ 			flags = 0;
+ 		flags |= POPUP_CLOSEANYKEY;
+ 	}
++	if (args_has(args, 'M')) {
++		if (flags == -1)
++			flags = 0;
++		flags |= POPUP_STATUSMOUSE;
++	}
+ 
+--- a/tmux.h
++++ b/tmux.h
+@@ -3807,3 +3807,4 @@
+ #define POPUP_CLOSEANYKEY 0x8
+ #define POPUP_NOJOB 0x10
++#define POPUP_STATUSMOUSE 0x20
+ typedef void (*popup_close_cb)(int, void *);
+--- a/format.c
++++ b/format.c
+@@ -5893,3 +5893,6 @@
+ 	struct paste_buffer	*pb;
+ 
++	/* Versioned capability for the opt-in display-popup -M extension. */
++	format_add(ft, "aft_popup_status_mouse", "%d", 1);
++
+ 	if (c != NULL && c->name != NULL)
+--- a/popup.c
++++ b/popup.c
+@@ -567,2 +567,3 @@
+ 	u_int			 px, py, x;
++	int			 statusat;
+ 	enum { NONE, LEFT, RIGHT, TOP, BOTTOM } border = NONE;
+@@ -590,4 +591,21 @@
+ 		    m->y > pd->py + pd->sy - 1) {
++			statusat = status_at_line(c);
++			if ((pd->flags & POPUP_STATUSMOUSE) &&
++			    options_get_number(c->session->options, "mouse") &&
++			    statusat >= 0 && m->y >= (u_int)statusat &&
++			    m->y - statusat < status_line_size(c) &&
++			    m->x < c->tty.sx && m->y < c->tty.sy &&
++			    m->b == MOUSE_BUTTON_1 && m->sgr_type != 'm') {
++				/*
++				 * Return 2 closes the overlay and queues this same
++				 * event for native mouse classification/bindings.
++				 * Do not synthesize a key: it would lose the status
++				 * range, coordinates and originating client.
++				 */
++				pd->status = 0;
++				return (2);
++			}
++
+ 			if (MOUSE_BUTTONS(m->b) == MOUSE_BUTTON_3)
+ 				goto menu;
+ 			return (0);

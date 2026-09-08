@@ -83,6 +83,9 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
     let invocation = decision.invocation.unwrap();
     assert_eq!(invocation.liveness(), Liveness::Alive);
     assert!(!eligible(pid, &tty, &[]).unwrap().eligible);
+    assert!(!foreground_nvim(pid, &tty).unwrap());
+    assert!(foreground_nvim(pid, Path::new("/dev/null")).is_err());
+    assert!(foreground_nvim(0, &tty).is_err());
     assert!(eligible(pid, Path::new("/dev/null"), &mappings).is_err());
     // SAFETY: pid is the live child owned by Job; SIGSTOP changes no parent memory.
     assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
@@ -92,6 +95,7 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(!eligible(pid, &tty, &mappings).unwrap().eligible);
+    assert!(foreground_nvim(pid, &tty).is_err());
     assert_eq!(invocation.liveness(), Liveness::Alive);
     // Leave the child unreaped so zombie metadata also counts as an ended invocation.
     job.0.kill().unwrap();
@@ -103,6 +107,57 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
     job.0.wait().unwrap();
     assert_eq!(invocation.liveness(), Liveness::Exited);
     assert_eq!(confirm_missing(pid).unwrap(), None);
+    assert!(foreground_nvim(pid, &tty).is_err());
+}
+
+#[test]
+fn foreground_editor_uses_executable_not_argv_and_rejects_stopped_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("nvim");
+    // A named fixture tests executable/TTY identity, not real editor navigation.
+    let source = root.path().join("editor.c");
+    std::fs::write(
+        &source,
+        "#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n",
+    )
+    .unwrap();
+    assert!(Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .status()
+        .unwrap()
+        .success());
+    let (_master, slave, tty) = terminal();
+    let mut command = Command::new(executable);
+    command
+        .arg0("not-an-editor")
+        .arg("30")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    // SAFETY: only async-signal-safe calls run after fork, on this child's PTY.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let job = Job(command.spawn().unwrap());
+    let pid = job.0.id();
+    assert!(foreground_nvim(pid, &tty).unwrap());
+    let (_other_master, _other_slave, other_tty) = terminal();
+    assert!(foreground_nvim(pid, &other_tty).is_err());
+    // SAFETY: only the positive PID of our owned fixture child is signaled.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    let start = Instant::now();
+    while platform::identity(pid).unwrap().unwrap().runnable {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(foreground_nvim(pid, &tty).is_err());
 }
 
 struct FixtureJob(Child);

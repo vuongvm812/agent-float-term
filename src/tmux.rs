@@ -1398,13 +1398,20 @@ fn popup(
     let result = (|| -> Result<std::process::ExitStatus> {
         let command = lifecycle::viewer_command(tmux, &target, &instance, &worker)?;
         routing::prepare(tmux, pane, client, &target, config)?;
+        // Query the running server, not the client version. Stock tmux retains
+        // its popup behavior; only our versioned extension accepts this flag.
+        let status_mouse =
+            tmux.output(&["display-message", "-p", "#{aft_popup_status_mouse}"])? == "1";
         drop(guard);
         // This client waits only while the popup is visible. Detaching the inner client
         // exits its command, which closes -E without terminating the retained shell.
-        Ok(tmux
-            .command()
+        let mut popup = tmux.command();
+        popup.arg("display-popup");
+        if status_mouse {
+            popup.arg("-M");
+        }
+        Ok(popup
             .args([
-                "display-popup",
                 "-E",
                 "-s",
                 "fg=terminal,bg=terminal",
@@ -1592,6 +1599,14 @@ pub fn doctor(socket: Option<PathBuf>) -> Result<()> {
         "tmux client: {} ({})",
         tmux.binary.display(),
         tmux.client_version()?
+    );
+    println!(
+        "Status-bar mouse: {}",
+        if tmux.output(&["display-message", "-p", "#{aft_popup_status_mouse}"])? == "1" {
+            "supported; an exposed status-bar left click dismisses the float and uses the main binding"
+        } else {
+            "unavailable on this server; hide the float first (requires the opt-in tmux status-mouse patch)"
+        }
     );
     let last_error = tmux.global("@aft_last_error")?;
     if !last_error.is_empty() {

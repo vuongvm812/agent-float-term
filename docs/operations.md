@@ -333,9 +333,34 @@ restoration is checked approximately once per second, not on every redraw.
 
 Private input tables disable inner tmux keyboard commands. Main binding keys are
 refreshed on each opening; changes made while the popup is open take effect on
-the next opening. Mouse events stay with the float rather than being replayed
-against unrelated main-pane coordinates. Explicit `tmux` commands typed into the
-floating shell are still ordinary shell commands, not sandboxed.
+the next opening. There is one application-input exception: `Ctrl+h/j/k/l` go
+directly to foreground Neovim inside the float, even if they are main root bindings
+or prefixes. This preserves your Neovim mappings; it does not install editor
+mappings. Outside Neovim, the keys retain their normal main binding/prefix behavior,
+or pass to the floating application if unbound. Other tmux shortcuts still target
+main. The configured float toggle remains reserved, including if it uses one of
+these four keys. Copy mode and tmux prompts retain their native input handling.
+
+Neovim recognition uses the retained shell's actual TTY, foreground group leader,
+executable basename `nvim`, and revalidated process identities through a shell-only
+ancestry chain. It does not inspect process environments, editor configuration, or
+buffer contents. A suspended/background editor does not claim a foreground shell's
+keys. If inspection fails or races, these four keys stay in the float. Remote
+editors, renamed executables, and Neovim's internal terminal-job focus are not
+inferred. Navigation plugins that themselves issue explicit tmux commands at an
+editor split boundary retain their own behavior; those commands are not sandboxed
+or redirected by this exception.
+
+Mouse events inside the popup stay with the float rather than being replayed
+against unrelated main-pane coordinates. With the optional
+[tmux status-mouse patch](status-bar-mouse.md), a left click on an exposed main
+status row dismisses the popup and invokes the original main mouse binding. The
+shell survives, and returning to its original AI pane restores the float.
+`doctor` reports whether the running server supports this behavior. **Stock tmux
+still requires hiding the popup before clicking the status bar.** An application
+update alone cannot upgrade an already-running tmux server. The native-pane
+prototype remains disabled; no user bindings are wrapped. Explicit `tmux` commands
+typed into the floating shell remain ordinary commands.
 
 Restoration reserves an unused tmux `User` key with no terminal byte sequence.
 It enters native client input handling, so a prompt or unrelated popup consumes

@@ -5,6 +5,30 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+### Status-Bar Mouse Switching
+
+- Add `make install` to build/install the managed application and a separate
+  persistent patched tmux build. `DRY_RUN=1` is a no-write preview. The target
+  prints activation instructions without starting or restarting any server.
+- Add a pinned, opt-in tmux 3.7c patch: `display-popup -M` dismisses the popup and
+  continues the original exposed-status left click through native main bindings.
+  Retain shell state and return-to-origin restoration; do not wrap user bindings.
+- Detect the running server's capability before using the flag and report support
+  in `doctor`. Stock tmux remains supported with its existing mouse limitation.
+- Add an isolated builder and stock/patched PTY regressions. No automatic tmux
+  installation, server restart, package replacement, or live-session migration.
+
+### Neovim Navigation
+
+- Let `Ctrl+h/j/k/l` reach foreground Neovim inside the float without changing
+  user tmux bindings or editor mappings. Keep main routing outside Neovim and
+  for dedicated tmux shortcuts; uncertain process inspection keeps keys local.
+- Add real-Neovim PTY coverage for split navigation, rapid input, main shortcut
+  handoff, suspend/resume, failed inspection, and retained editor state.
+- Add an isolated tmux 3.7c native-pane mouse/lifecycle probe, not a runtime
+  backend. Status clicking works in the probe, but prefix commands target the
+  viewer rather than main. Stock tmux popup mouse behavior remains unchanged.
+
 ### Coordinated Publication And Homebrew First Use
 
 - Add `make release` with an exact confirmation prompt and a local plan-only

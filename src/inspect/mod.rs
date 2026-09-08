@@ -257,6 +257,63 @@ pub fn eligible(pane_pid: u32, pane_tty: &Path, mappings: &[HarnessMapping]) -> 
     }
 }
 
+/// Recognize a foreground Neovim group leader without reading argv or environments.
+/// Errors mean unknown ownership: navigation keys should remain in the float.
+pub fn foreground_nvim(pane_pid: u32, pane_tty: &Path) -> Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+
+        ensure!(
+            pane_pid > 0 && pane_pid <= i32::MAX as u32,
+            "invalid pane PID"
+        );
+        let start = Instant::now();
+        let tty = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(pane_tty)?;
+        let metadata = tty.metadata()?;
+        ensure!(
+            metadata.file_type().is_char_device(),
+            "invalid pane terminal"
+        );
+        let device = platform::device(metadata.rdev());
+        let read = |pid| load(platform::identity(pid)?.context("process disappeared")?);
+        let capture = || -> Result<_> {
+            within_budget(start)?;
+            let pane = read(pane_pid)?;
+            let group = pane.identity.foreground;
+            ensure!(
+                pane.identity.tty == device && group > 0,
+                "foreground terminal changed"
+            );
+            let leader = read(group)?;
+            ensure!(
+                leader.identity.group == group
+                    && leader.identity.foreground == group
+                    && leader.identity.tty == device
+                    && leader.identity.runnable,
+                "foreground leader is not running on the pane terminal"
+            );
+            let shells = shell_chain(&pane, &leader, group, read)?;
+            Ok((pane, leader, shells))
+        };
+        let first = capture()?;
+        ensure!(
+            first == capture()?,
+            "foreground job changed during inspection"
+        );
+        within_budget(start)?;
+        Ok(first.1.executable.file_name() == Some(std::ffi::OsStr::new("nvim")))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pane_pid, pane_tty);
+        anyhow::bail!("process inspection is supported only on macOS and Linux")
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn foreground(pane_pid: u32, device: u64) -> Result<u32> {
     // A tmux run-shell helper need not have this controlling terminal. In particular,

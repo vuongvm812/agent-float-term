@@ -54,7 +54,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential bison pkg-config libevent-dev libncurses-dev curl ca-certificates expect procps bash zsh
+          sudo apt-get install --yes build-essential bison pkg-config libevent-dev libncurses-dev curl ca-certificates expect procps bash zsh neovim
       - name: Build checksum-pinned tmux (Linux)
         if: runner.os == 'Linux'
         env:
@@ -62,7 +62,7 @@ jobs:
         run: bash scripts/install-ci-tmux.sh "$TMUX_VERSION"
       - name: Install tmux and test shells (macOS)
         if: runner.os == 'macOS'
-        run: brew install tmux expect bash zsh
+        run: brew install tmux expect bash zsh neovim
       - name: Record tools and verify native target
         env:
           EXPECTED_TARGET: ${{ matrix.target }}
@@ -85,6 +85,8 @@ jobs:
         run: cargo +1.84.1 fmt --all -- --check
       - name: Release helper tests (including generated Ruby syntax)
         run: python3 -B -m unittest discover -s scripts -p 'test_release*.py' -v
+      - name: Local install orchestration tests (no live installation)
+        run: python3 -B -m unittest discover -s scripts -p 'test_install_local.py' -v
       - name: Clippy
         run: cargo +1.84.1 clippy --locked --all-targets -- -D warnings
       - name: Tests
@@ -122,3 +124,18 @@ jobs:
         run: expect tests/external_smoke.exp target/release/agent-float-term
       - name: Inspect and verify crates.io package
         run: bash scripts/verify-cargo-package.sh
+      - name: Stock popup mouse behavior (reference tmux)
+        if: runner.os == 'Linux' && matrix.tmux == '3.7c'
+        timeout-minutes: 3
+        run: expect tests/mouse_smoke.exp target/release/agent-float-term stock
+      - name: Build opt-in status-mouse tmux (no installation)
+        if: runner.os == 'Linux' && matrix.tmux == '3.7c'
+        timeout-minutes: 5
+        run: bash scripts/build-mouse-tmux.sh "$RUNNER_TEMP/tmux-status-mouse"
+      - name: Patched popup mouse and keyboard behavior
+        if: runner.os == 'Linux' && matrix.tmux == '3.7c'
+        timeout-minutes: 5
+        run: |
+          export PATH="$RUNNER_TEMP/tmux-status-mouse/tmux-3.7c:$PATH"
+          expect tests/mouse_smoke.exp target/release/agent-float-term patched
+          expect tests/pty_smoke.exp target/release/agent-float-term
