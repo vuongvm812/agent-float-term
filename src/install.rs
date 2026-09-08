@@ -1,7 +1,8 @@
 //! Explicit, user-local installation. Install/uninstall without `yes` are read-only previews.
 //! `yes` authorizes payload/templates, not implicit edits to shell or tmux user configuration.
 //! Each user integration requires its own explicit configuration path; omitted integrations
-//! are retained on reinstall. Run an extracted binary's `install --yes` directly, rather
+//! are retained on reinstall, except exact owned references migrated to a new layout.
+//! Run an extracted binary's `install --yes` directly, rather
 //! than placing an unowned regular file at the managed bin-symlink destination first.
 //! Updates accept local native executables only; no downloads or version probes are performed.
 
@@ -60,7 +61,7 @@ fn manifest(paths: &Paths) -> Result<(Snapshot, Option<Manifest>)> {
         .transpose()
         .context("invalid installation manifest")?;
     if let Some(value) = &value {
-        if value.format != 1 || value.paths != *paths {
+        if !matches!(value.format, 1 | 2) || value.paths != *paths {
             bail!("installation manifest version or directory roots do not match");
         }
         if !matches!(value.shell_kind.as_str(), "bash" | "zsh")
@@ -75,9 +76,16 @@ fn manifest(paths: &Paths) -> Result<(Snapshot, Option<Manifest>)> {
         {
             bail!("invalid installation manifest entries");
         }
+        let root = if value.format == 1 {
+            &paths.config
+        } else {
+            &paths.data
+        };
+        let mut names = std::collections::HashSet::new();
         for file in &value.files {
-            if file.path != paths.config.join("integration.tmux")
-                && file.path != paths.config.join("integration.sh")
+            if (file.path != root.join("integration.tmux")
+                && file.path != root.join("integration.sh"))
+                || !names.insert(file.path.file_name())
             {
                 bail!("manifest contains an unexpected owned file");
             }
@@ -231,8 +239,8 @@ fn integration(
             .to_str()
             .context("non-UTF-8 binary path")?,
     );
-    let tmux_file = paths.config.join("integration.tmux");
-    let shell_file = paths.config.join("integration.sh");
+    let tmux_file = paths.data.join("integration.tmux");
+    let shell_file = paths.data.join("integration.sh");
     // Setness matters: even `-ic ''` is a tool command, not a human prompt.
     let guards = format!(
         r#"[ -z "${{BASH_EXECUTION_STRING+x}}" ] && [ -z "${{ZSH_EXECUTION_STRING+x}}" ] &&
@@ -424,8 +432,8 @@ fn write_manifest(
 }
 
 /// Print a plan and return without creating even a lock file unless `options.yes` is true.
-/// User configuration is edited only for explicitly supplied integration paths. Reinstall
-/// retains all previously recorded integrations not selected by this invocation.
+/// Reinstall retains unselected integrations, except exact owned references that
+/// must move with the generated scripts during a layout migration.
 pub fn install(options: InstallOptions) -> Result<()> {
     // macOS may report the invoked symlink, including our stable installed entry
     // point. Resolve our own image; explicit update sources still reject symlinks.
@@ -436,7 +444,34 @@ pub fn install(options: InstallOptions) -> Result<()> {
 }
 
 fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<()> {
-    let (mut kind, mut files, mut blocks) = integration(paths, &options)?;
+    integration(paths, &options)?;
+    let _lock = if options.yes {
+        Some(lock(&paths.state)?)
+    } else {
+        None
+    };
+    let (manifest_before, old) = manifest(paths)?;
+    let migrating = old.as_ref().is_some_and(|value| value.format == 1);
+    let mut effective = options.clone();
+    if let Some(old) = &old {
+        if options.shell_config.is_none() {
+            effective.shell_kind = Some(old.shell_kind.clone());
+        }
+        if migrating {
+            for installed in &old.blocks {
+                match block_kind(installed)? {
+                    "shell" if effective.shell_config.is_none() => {
+                        effective.shell_config = Some(installed.path.clone())
+                    }
+                    "tmux" if effective.tmux_config.is_none() => {
+                        effective.tmux_config = Some(installed.path.clone())
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+    let (kind, files, mut blocks) = integration(paths, &effective)?;
     println!("Install agent-float-term from {}", source.display());
     println!(
         "  Releases: {}",
@@ -453,7 +488,19 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     for block in &blocks {
         println!("  Managed block: {}", block.path.display());
     }
-    println!("  Unselected user configurations will not be edited; existing integration blocks are retained.");
+    if migrating {
+        println!("  Migrate legacy layout: update exact recorded startup blocks and remove only intact legacy scripts.");
+        for file in &old.as_ref().context("missing migration manifest")?.files {
+            if !files.iter().any(|new| new.path == file.path) {
+                println!(
+                    "  Remove after migration (only if intact): {}",
+                    file.path.display()
+                );
+            }
+        }
+    } else {
+        println!("  Unselected user configurations will not be edited; existing integration blocks are retained.");
+    }
     println!("  Private manifest/backups: {}", paths.state.display());
     if !options.yes {
         println!("Preview only; pass --yes to apply. No files changed.");
@@ -461,18 +508,7 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     }
     let bytes = native_binary(source)?;
     let id = digest(&bytes);
-    let _lock = lock(&paths.state)?;
-    let (manifest_before, old) = manifest(paths)?;
     if let Some(old) = &old {
-        if options.shell_config.is_none() {
-            (kind, files, _) = integration(
-                paths,
-                &InstallOptions {
-                    shell_kind: Some(old.shell_kind.clone()),
-                    ..options.clone()
-                },
-            )?;
-        }
         for selected in &blocks {
             for installed in &old.blocks {
                 let same_kind = block_kind(selected)? == block_kind(installed)?;
@@ -483,6 +519,22 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         }
     }
     let mut edits = Vec::new();
+    let mut removals = Vec::new();
+    if let Some(old) = old.as_ref().filter(|_| migrating) {
+        for file in &old.files {
+            if files.iter().any(|new| new.path == file.path) {
+                continue;
+            }
+            let before = snapshot(&file.path)?;
+            if regular(&before)? != Some(file.text.as_bytes()) {
+                bail!(
+                    "legacy integration is missing or edited; migration left it untouched: {}",
+                    file.path.display()
+                );
+            }
+            removals.push((file.path.clone(), before, Content::Missing));
+        }
+    }
     for file in &files {
         let before = snapshot(&file.path)?;
         let existing = regular(&before)?;
@@ -524,9 +576,7 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         let content = file_content(&before, replacement);
         edits.push((block.path.clone(), before, content));
     }
-    for directory in [&paths.config, &paths.data] {
-        private_dir(directory)?;
-    }
+    private_dir(&paths.data)?;
     ensure_user_dir(&paths.bin)?;
     private_dir(&paths.data.join("releases"))?;
     let current_before = owned_link(
@@ -544,7 +594,7 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
             .as_deref(),
     )?;
     let mut next = old.clone().unwrap_or(Manifest {
-        format: 1,
+        format: 2,
         paths: paths.clone(),
         shell_kind: kind.clone(),
         current: None,
@@ -558,7 +608,9 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     }
     let mut tx = Transaction::new(&paths.state)?;
     stage_release(&mut tx, paths, &id, &bytes)?;
-    for (path, before, content) in edits {
+    // Install the new targets and repoint exact managed blocks before removing
+    // legacy scripts. The transaction restores every changed file on failure.
+    for (path, before, content) in edits.into_iter().chain(removals) {
         tx.change(&path, &before, content)?;
     }
     if next.current.as_deref() != Some(&id) {
@@ -567,6 +619,7 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     if !next.releases.contains(&id) {
         next.releases.push(id.clone());
     }
+    next.format = 2;
     next.files = files;
     if options.shell_config.is_some() {
         next.shell_kind = kind;
@@ -590,7 +643,7 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
     )?;
     write_manifest(&mut tx, paths, &manifest_before, &next)?;
     tx.commit()?;
-    println!("Installed {id}. Only explicitly selected user configurations were edited; existing tmux sessions are untouched.");
+    println!("Installed {id}. Only selected or migration-owned startup blocks were edited; existing tmux sessions are untouched.");
     Ok(())
 }
 
@@ -747,7 +800,6 @@ fn uninstall_at_with_hook(
         return Ok(());
     }
     private_dir(&paths.data)?;
-    private_dir(&paths.config)?;
     let (before, value) = manifest(paths)?;
     let mut value = value.context("manifest disappeared concurrently")?;
     let mut edits = Vec::new();
@@ -869,7 +921,7 @@ fn uninstall_at_with_hook(
         }
     }
     let _ = fs::remove_dir(paths.data.join("releases"));
-    println!("Uninstalled owned content. Sessions, config.toml, user edits, and private backups were preserved.");
+    println!("Uninstalled owned content. Sessions, user configuration, user edits, and private backups were preserved.");
     Ok(())
 }
 
@@ -947,6 +999,205 @@ mod tests {
         }
         assert!(!fixture.options.tmux_config.as_ref().unwrap().exists());
         assert!(!fixture.options.shell_config.as_ref().unwrap().exists());
+    }
+
+    fn legacy_install(fixture: &Fixture) -> Manifest {
+        fixture.install().unwrap();
+        let mut value = manifest(&fixture.paths).unwrap().1.unwrap();
+        let mut legacy_paths = fixture.paths.clone();
+        legacy_paths.data = fixture.paths.config.clone();
+        let (_, files, mut blocks) = integration(&legacy_paths, &fixture.options).unwrap();
+        private_dir(&fixture.paths.config).unwrap();
+        for (current, legacy) in value.files.iter().zip(&files) {
+            fs::write(&legacy.path, &legacy.text).unwrap();
+            fs::remove_file(&current.path).unwrap();
+        }
+        for (current, legacy) in value.blocks.iter().zip(&mut blocks) {
+            if current.text.starts_with('\n') {
+                legacy.text.insert(0, '\n');
+            }
+            let mut bytes = fs::read(&current.path).unwrap();
+            let range = block_range(&bytes, &current.text).unwrap();
+            bytes.splice(range, legacy.text.bytes());
+            fs::write(&legacy.path, bytes).unwrap();
+        }
+        value.format = 1;
+        value.files = files;
+        value.blocks = blocks;
+        fs::write(
+            fixture.paths.state.join("install.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        value
+    }
+
+    #[test]
+    fn legacy_layout_migration_preserves_settings_and_unrelated_startup_bytes() {
+        for kind in ["bash", "zsh"] {
+            let mut fixture = Fixture::new();
+            fixture.options.shell_kind = Some(kind.into());
+            for path in [&fixture.options.shell_config, &fixture.options.tmux_config]
+                .into_iter()
+                .flatten()
+            {
+                fs::write(path, "# user prefix without newline").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let legacy = legacy_install(&fixture);
+            let settings = fixture.paths.config.join("config.json");
+            fs::write(&settings, "{\"shortcut\":\"F8\",\"width\":70}").unwrap();
+            let settings_before = snapshot(&settings).unwrap();
+            for block in &legacy.blocks {
+                let mut bytes = fs::read(&block.path).unwrap();
+                bytes.extend_from_slice(b"# user suffix\n");
+                fs::write(&block.path, bytes).unwrap();
+            }
+            let paths: Vec<_> = legacy
+                .files
+                .iter()
+                .chain(&legacy.blocks)
+                .map(|f| f.path.clone())
+                .chain([
+                    fixture.paths.state.join("install.json"),
+                    fixture.paths.data.join("current"),
+                ])
+                .collect();
+            let before: Vec<_> = paths.iter().map(|path| snapshot(path).unwrap()).collect();
+            install_at(
+                &fixture.paths,
+                InstallOptions::default(),
+                Path::new("/no/source/required/for/preview"),
+            )
+            .unwrap();
+            for (path, original) in paths.iter().zip(&before) {
+                assert_eq!(snapshot(path).unwrap(), *original);
+            }
+            assert!(!fixture.paths.data.join("integration.sh").exists());
+
+            let options = InstallOptions {
+                yes: true,
+                ..InstallOptions::default()
+            };
+            install_at(&fixture.paths, options.clone(), &fixture.source).unwrap();
+            let migrated = manifest(&fixture.paths).unwrap().1.unwrap();
+            assert_eq!(migrated.format, 2);
+            assert_eq!(migrated.shell_kind, kind);
+            assert_eq!(migrated.blocks.len(), legacy.blocks.len());
+            for file in &migrated.files {
+                assert_eq!(file.path.parent(), Some(fixture.paths.data.as_path()));
+                assert_eq!(fs::read_to_string(&file.path).unwrap(), file.text);
+            }
+            for file in &legacy.files {
+                assert!(!file.path.exists());
+            }
+            for block in &migrated.blocks {
+                let bytes = fs::read(&block.path).unwrap();
+                let range = block_range(&bytes, &block.text).unwrap();
+                assert_eq!(&bytes[..range.start], b"# user prefix without newline");
+                assert_eq!(&bytes[range.end..], b"# user suffix\n");
+                assert_eq!(fs::metadata(&block.path).unwrap().mode() & 0o777, 0o640);
+            }
+            assert_eq!(snapshot(&settings).unwrap(), settings_before);
+            let manifest_before = snapshot(&fixture.paths.state.join("install.json")).unwrap();
+            install_at(&fixture.paths, options, &fixture.source).unwrap();
+            assert_eq!(
+                snapshot(&fixture.paths.state.join("install.json")).unwrap(),
+                manifest_before
+            );
+            uninstall_at(&fixture.paths, true).unwrap();
+            assert_eq!(snapshot(&settings).unwrap(), settings_before);
+            for block in &migrated.blocks {
+                assert_eq!(
+                    fs::read_to_string(&block.path).unwrap(),
+                    "# user prefix without newline\n# user suffix\n"
+                );
+            }
+            for file in &migrated.files {
+                assert!(!file.path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_migration_refuses_modified_missing_and_unowned_content() {
+        for case in [
+            "edited script",
+            "missing script",
+            "edited block",
+            "missing block",
+            "occupied destination",
+            "symlink destination",
+        ] {
+            let fixture = Fixture::new();
+            let legacy = legacy_install(&fixture);
+            let destination = fixture.paths.data.join("integration.sh");
+            match case {
+                "edited script" => fs::write(&legacy.files[1].path, "# user script\n").unwrap(),
+                "missing script" => fs::remove_file(&legacy.files[1].path).unwrap(),
+                "edited block" => {
+                    fs::write(&legacy.blocks[1].path, "# user removed the block\n").unwrap()
+                }
+                "missing block" => fs::remove_file(&legacy.blocks[1].path).unwrap(),
+                "occupied destination" => fs::write(&destination, &legacy.files[1].text).unwrap(),
+                "symlink destination" => symlink(&legacy.files[1].path, &destination).unwrap(),
+                _ => unreachable!(),
+            }
+            let paths: Vec<_> = legacy
+                .files
+                .iter()
+                .chain(&legacy.blocks)
+                .map(|file| file.path.clone())
+                .chain([
+                    fixture.paths.state.join("install.json"),
+                    fixture.paths.data.join("current"),
+                    fixture.paths.data.join("integration.tmux"),
+                    destination,
+                ])
+                .collect();
+            let before: Vec<_> = paths.iter().map(|path| snapshot(path).unwrap()).collect();
+            assert!(
+                install_at(
+                    &fixture.paths,
+                    InstallOptions {
+                        yes: true,
+                        ..InstallOptions::default()
+                    },
+                    &fixture.source
+                )
+                .is_err(),
+                "{case}"
+            );
+            for (path, original) in paths.iter().zip(before) {
+                assert_eq!(
+                    snapshot(path).unwrap(),
+                    original,
+                    "{case}: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_layout_version_and_unique_owned_files_are_enforced() {
+        let fixture = Fixture::new();
+        fixture.install().unwrap();
+        let path = fixture.paths.state.join("install.json");
+        let value = manifest(&fixture.paths).unwrap().1.unwrap();
+        for case in ["version", "wrong root", "duplicate"] {
+            let mut invalid = value.clone();
+            match case {
+                "version" => invalid.format = 3,
+                "wrong root" => {
+                    invalid.files[0].path = fixture.paths.config.join("integration.tmux")
+                }
+                "duplicate" => invalid.files[1] = invalid.files[0].clone(),
+                _ => unreachable!(),
+            }
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(manifest(&fixture.paths).is_err(), "{case}");
+        }
     }
 
     #[test]
@@ -1214,7 +1465,7 @@ mod tests {
         uninstall_at_with_hook(&fixture.paths, true, || {
             called.set(true);
             assert!(fixture.paths.bin.join(BINARY).is_file());
-            assert!(fixture.paths.config.join("integration.tmux").is_file());
+            assert!(fixture.paths.data.join("integration.tmux").is_file());
             assert!(
                 fs::read_to_string(fixture.options.tmux_config.as_ref().unwrap())
                     .unwrap()
@@ -1235,7 +1486,7 @@ mod tests {
             fixture.paths.bin.join(BINARY),
             fixture.paths.data.join("current"),
             fixture.paths.state.join("install.json"),
-            fixture.paths.config.join("integration.sh"),
+            fixture.paths.data.join("integration.sh"),
             fixture.options.tmux_config.clone().unwrap(),
             fixture.options.shell_config.clone().unwrap(),
         ];
@@ -1311,7 +1562,7 @@ mod tests {
             .unwrap()
             .replace("source-file", "# user edited source-file");
         fs::write(tmux, &edited).unwrap();
-        let integration = fixture.paths.config.join("integration.sh");
+        let integration = fixture.paths.data.join("integration.sh");
         fs::write(&integration, "# user-owned now\n").unwrap();
         assert!(fixture.install().is_err());
         uninstall_at(&fixture.paths, true).unwrap();
@@ -1801,7 +2052,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                private_dir(&fixture.paths.config).unwrap();
+                private_dir(&fixture.paths.data).unwrap();
                 fs::write(&files[1].path, &files[1].text).unwrap();
                 let block = &blocks
                     .iter()
@@ -1916,7 +2167,7 @@ exit 0
             String::from_utf8_lossy(&output.stderr)
         );
         ensure_user_dir(&fixture.paths.bin).unwrap();
-        private_dir(&fixture.paths.config).unwrap();
+        private_dir(&fixture.paths.data).unwrap();
         let marker = fixture.source.parent().unwrap().join("bound");
         let binary = fixture.paths.bin.join(BINARY);
         fs::write(

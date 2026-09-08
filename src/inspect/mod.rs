@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::HarnessMapping;
 use crate::harness::{self, Harness};
@@ -43,6 +44,8 @@ const BUDGET: Duration = Duration::from_millis(300);
 pub struct Decision {
     pub eligible: bool,
     pub reason: &'static str,
+    /// Present only for an eligible job whose two snapshots matched.
+    pub invocation: Option<Invocation>,
 }
 
 impl Decision {
@@ -50,8 +53,94 @@ impl Decision {
         Self {
             eligible: false,
             reason,
+            invocation: None,
         }
     }
+}
+
+/// Identity of a validated frontend launch, independent of helpers and job control.
+/// Kernel start times are platform-specific; tokens are local to this host/boot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Invocation {
+    frontend: ProcessKey,
+    wrapper: Option<ProcessKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ProcessKey {
+    pid: u32,
+    started: (u64, u64),
+}
+
+impl From<&Identity> for ProcessKey {
+    fn from(identity: &Identity) -> Self {
+        Self {
+            pid: identity.pid,
+            started: identity.started,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Liveness {
+    /// Every tracked process still exists, including stopped processes.
+    Alive,
+    /// At least one tracked process exited, is a zombie, or its PID was reused.
+    Exited,
+    /// Metadata could not establish whether the invocation still exists.
+    Unknown,
+}
+
+impl Invocation {
+    /// Check only PID/start-time/state metadata, not foreground eligibility.
+    /// This is a best-effort observation, not an atomic guarantee of continued life.
+    pub fn liveness(&self) -> Liveness {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.liveness_with(platform::identity)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Liveness::Unknown
+        }
+    }
+
+    fn liveness_with(&self, mut read: impl FnMut(u32) -> Result<Option<Identity>>) -> Liveness {
+        let mut result = Liveness::Alive;
+        for key in std::iter::once(&self.frontend).chain(self.wrapper.iter()) {
+            // Deserialized tokens must never turn PID 0/negative into group probes.
+            if key.pid == 0 || key.pid > i32::MAX as u32 {
+                result = Liveness::Unknown;
+                continue;
+            }
+            match read(key.pid) {
+                Ok(None) => return Liveness::Exited,
+                Ok(Some(identity)) if identity.pid == key.pid => {
+                    if identity.started != key.started || identity.liveness == Liveness::Exited {
+                        return Liveness::Exited;
+                    }
+                    if identity.liveness == Liveness::Unknown {
+                        result = Liveness::Unknown;
+                    }
+                }
+                Ok(Some(_)) | Err(_) => result = Liveness::Unknown,
+            }
+        }
+        result
+    }
+}
+
+// Missing procfs metadata can mean hidepid permissions or an unavailable mount,
+// not death. A signal-0 probe can confirm absence, but cannot confirm identity.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn confirm_missing(pid: u32) -> Result<Option<Identity>> {
+    ensure!(pid > 0 && pid <= i32::MAX as u32, "invalid process PID");
+    // SAFETY: a positive, validated PID and signal 0 only query existence/permission.
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    anyhow::bail!("process metadata unavailable without confirmed process exit")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +152,7 @@ struct Identity {
     foreground: u32,
     started: (u64, u64),
     runnable: bool,
+    liveness: Liveness,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -440,10 +530,37 @@ fn inspect(pane_pid: u32, pane_tty: &Path, mappings: &[HarnessMapping]) -> Resul
     );
     let second = snapshot(pane_pid, device, group, &canonical_mappings, start)?;
     ensure!(
-        first == second && foreground(pane_pid, device)? == group,
+        foreground(pane_pid, device)? == group,
         "foreground job changed during inspection"
     );
+    let decision = validated_decision(&first, &second, group, &canonical_mappings)?;
     within_budget(start)?;
+    Ok(decision)
+}
+
+fn validated_decision(
+    first: &Snapshot,
+    second: &Snapshot,
+    group: u32,
+    mappings: &[HarnessMapping],
+) -> Result<Decision> {
+    ensure!(first == second, "foreground job changed during inspection");
+    let mut decision = decide(&first.pane, &first.members, group, mappings);
+    if decision.eligible {
+        let leader = first
+            .members
+            .iter()
+            .find(|p| p.identity.pid == group)
+            .expect("eligible job has a group leader");
+        let native = first
+            .members
+            .iter()
+            .find(|p| frontend_child(leader, p, mappings));
+        decision.invocation = Some(Invocation {
+            frontend: ProcessKey::from(&native.unwrap_or(leader).identity),
+            wrapper: native.map(|_| ProcessKey::from(&leader.identity)),
+        });
+    }
     Ok(decision)
 }
 
@@ -536,6 +653,7 @@ fn decide(
     }
     Decision {
         eligible: true,
+        invocation: None,
         reason: if members.len() > 1 + usize::from(native.is_some()) {
             "recognized interactive frontend with nonterminal same-group helpers"
         } else if native.is_some() {
@@ -561,12 +679,287 @@ mod tests {
                 foreground: 20,
                 started: (1, 0),
                 runnable: true,
+                liveness: Liveness::Alive,
             },
             executable: exe.into(),
             executable_id: ExecutableId::default(),
             argv: argv.iter().map(OsString::from).collect(),
             descriptors: None,
         }
+    }
+
+    #[test]
+    fn invocation_requires_matching_snapshots_but_ignores_helper_churn_between_inspections() {
+        let mut snapshot = Snapshot {
+            pane: process(10, 1, "/bin/bash", &["bash"]),
+            members: vec![process(
+                20,
+                10,
+                "/home/alice/.opencode/bin/opencode",
+                &["opencode"],
+            )],
+            shells: Vec::new(),
+        };
+        assert!(decide(&snapshot.pane, &snapshot.members, 20, &[])
+            .invocation
+            .is_none());
+        let original = validated_decision(&snapshot, &snapshot, 20, &[])
+            .unwrap()
+            .invocation
+            .unwrap();
+        assert_eq!(
+            original.frontend,
+            ProcessKey {
+                pid: 20,
+                started: (1, 0)
+            }
+        );
+        assert_eq!(original.wrapper, None);
+        let encoded = serde_json::to_string(&original).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Invocation>(&encoded).unwrap(),
+            original
+        );
+
+        let mut helper = process(21, 20, "/usr/bin/node", &[]);
+        helper.descriptors = Some(Descriptors {
+            stdin: Input::Pipe,
+            extra_terminal: false,
+        });
+        snapshot.members.push(helper);
+        for pid in [21, 22, 23] {
+            snapshot.members[1].identity.pid = pid;
+            snapshot.members[1].identity.started.0 += 1;
+            assert_eq!(
+                validated_decision(&snapshot, &snapshot, 20, &[])
+                    .unwrap()
+                    .invocation,
+                Some(original)
+            );
+        }
+        let mut changed = snapshot.clone();
+        changed.members.pop();
+        assert!(validated_decision(&snapshot, &changed, 20, &[]).is_err());
+        assert_eq!(
+            validated_decision(&changed, &changed, 20, &[])
+                .unwrap()
+                .invocation,
+            Some(original)
+        );
+        for field in ["pid", "started", "subsecond"] {
+            let mut changed = snapshot.clone();
+            let mut group = 20;
+            match field {
+                "pid" => {
+                    group = 30;
+                    changed.members[0].identity.pid = group;
+                    changed.members[1].identity.parent = group;
+                }
+                "started" => changed.members[0].identity.started.0 += 1,
+                "subsecond" => changed.members[0].identity.started.1 += 1,
+                _ => unreachable!(),
+            }
+            assert!(validated_decision(&snapshot, &changed, group, &[]).is_err());
+            assert_ne!(
+                validated_decision(&changed, &changed, group, &[])
+                    .unwrap()
+                    .invocation,
+                Some(original)
+            );
+        }
+        snapshot.members[0].identity.runnable = false;
+        let rejected = validated_decision(&snapshot, &snapshot, 20, &[]).unwrap();
+        assert!(!rejected.eligible);
+        assert_eq!(rejected.invocation, None);
+    }
+
+    #[test]
+    fn pair_invocation_tracks_native_and_wrapper_not_helpers() {
+        for (entry, executable, name) in [
+            (
+                "/usr/lib/node_modules/@openai/codex/bin/codex.js",
+                "/usr/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex",
+                "codex",
+            ),
+            (
+                "/usr/lib/node_modules/opencode-ai/bin/opencode",
+                "/usr/lib/node_modules/opencode-linux-x64/bin/opencode",
+                "opencode",
+            ),
+        ] {
+            let mut snapshot = Snapshot {
+                pane: process(10, 1, "/bin/bash", &["bash"]),
+                members: vec![
+                    process(20, 10, "/usr/bin/node", &["node", entry]),
+                    process(21, 20, executable, &[name]),
+                ],
+                shells: Vec::new(),
+            };
+            let invocation = validated_decision(&snapshot, &snapshot, 20, &[])
+                .unwrap()
+                .invocation
+                .unwrap();
+            assert_eq!(
+                invocation.frontend,
+                ProcessKey::from(&snapshot.members[1].identity)
+            );
+            assert_eq!(
+                invocation.wrapper,
+                Some(ProcessKey::from(&snapshot.members[0].identity))
+            );
+            let mut reads = Vec::new();
+            assert_eq!(
+                invocation.liveness_with(|pid| {
+                    reads.push(pid);
+                    Ok(snapshot
+                        .members
+                        .iter()
+                        .find(|p| p.identity.pid == pid)
+                        .map(|p| p.identity.clone()))
+                }),
+                Liveness::Alive
+            );
+            assert_eq!(reads, vec![21, 20]);
+            assert_eq!(
+                invocation.liveness_with(|pid| {
+                    if pid == 20 {
+                        bail!("wrapper metadata unavailable");
+                    }
+                    Ok(Some(snapshot.members[1].identity.clone()))
+                }),
+                Liveness::Unknown
+            );
+
+            let mut helper = process(22, 21, "/usr/bin/node", &[]);
+            helper.descriptors = Some(Descriptors {
+                stdin: Input::Socket,
+                extra_terminal: false,
+            });
+            snapshot.members.push(helper);
+            assert_eq!(
+                validated_decision(&snapshot, &snapshot, 20, &[])
+                    .unwrap()
+                    .invocation,
+                Some(invocation)
+            );
+            snapshot.members.reverse();
+            assert_eq!(
+                validated_decision(&snapshot, &snapshot, 20, &[])
+                    .unwrap()
+                    .invocation,
+                Some(invocation)
+            );
+            for pid in [20, 21] {
+                let mut changed = snapshot.clone();
+                changed
+                    .members
+                    .iter_mut()
+                    .find(|p| p.identity.pid == pid)
+                    .unwrap()
+                    .identity
+                    .started
+                    .0 += 1;
+                assert_ne!(
+                    validated_decision(&changed, &changed, 20, &[])
+                        .unwrap()
+                        .invocation,
+                    Some(invocation)
+                );
+                assert_eq!(
+                    invocation.liveness_with(|read_pid| {
+                        Ok(changed
+                            .members
+                            .iter()
+                            .find(|p| p.identity.pid == read_pid)
+                            .map(|p| p.identity.clone()))
+                    }),
+                    Liveness::Exited
+                );
+                // Positive evidence of either process ending wins over an unreadable peer.
+                assert_eq!(
+                    invocation.liveness_with(|read_pid| {
+                        if read_pid == pid {
+                            Ok(None)
+                        } else {
+                            bail!("permission denied")
+                        }
+                    }),
+                    Liveness::Exited
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifetime_distinguishes_stops_reuse_zombies_and_unknown_metadata() {
+        let mut identity = process(20, 10, "/bin/test", &[]).identity;
+        let invocation = Invocation {
+            frontend: ProcessKey::from(&identity),
+            wrapper: None,
+        };
+        identity.runnable = false;
+        identity.parent = 99;
+        identity.group = 99;
+        identity.tty = 0;
+        identity.foreground = 0;
+        assert_eq!(
+            invocation.liveness_with(|_| Ok(Some(identity.clone()))),
+            Liveness::Alive
+        );
+        identity.liveness = Liveness::Exited;
+        assert_eq!(
+            invocation.liveness_with(|_| Ok(Some(identity.clone()))),
+            Liveness::Exited
+        );
+        identity.liveness = Liveness::Unknown;
+        assert_eq!(
+            invocation.liveness_with(|_| Ok(Some(identity.clone()))),
+            Liveness::Unknown
+        );
+        identity.started.0 += 1;
+        assert_eq!(
+            invocation.liveness_with(|_| Ok(Some(identity.clone()))),
+            Liveness::Exited
+        );
+        identity.pid += 1;
+        assert_eq!(
+            invocation.liveness_with(|_| Ok(Some(identity.clone()))),
+            Liveness::Unknown
+        );
+        assert_eq!(invocation.liveness_with(|_| Ok(None)), Liveness::Exited);
+        for errno in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EIO,
+            libc::ENOENT,
+            libc::ESRCH,
+        ] {
+            assert_eq!(
+                invocation.liveness_with(|_| Err(std::io::Error::from_raw_os_error(errno).into())),
+                Liveness::Unknown
+            );
+        }
+        for pid in [0, u32::MAX] {
+            let invalid = Invocation {
+                frontend: ProcessKey {
+                    pid,
+                    started: (1, 0),
+                },
+                wrapper: None,
+            };
+            assert_eq!(
+                invalid.liveness_with(|_| panic!("invalid PID must not be queried")),
+                Liveness::Unknown
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_metadata_does_not_imply_death() {
+        assert!(confirm_missing(std::process::id()).is_err());
+        assert!(confirm_missing(0).is_err());
+        assert!(confirm_missing(u32::MAX).is_err());
     }
 
     #[test]

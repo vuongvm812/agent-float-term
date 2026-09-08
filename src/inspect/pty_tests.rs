@@ -70,7 +70,7 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
             Ok(())
         });
     }
-    let job = Job(command.spawn().unwrap());
+    let mut job = Job(command.spawn().unwrap());
     let pid = job.0.id();
     let mappings = [HarnessMapping {
         harness: "codex".into(),
@@ -78,7 +78,10 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
     }];
     // This test explicitly opts sleep into the classifier. It tests OS plumbing,
     // not the authenticity of an AI binary or its actual keyboard ownership.
-    assert!(eligible(pid, &tty, &mappings).unwrap().eligible);
+    let decision = eligible(pid, &tty, &mappings).unwrap();
+    assert!(decision.eligible);
+    let invocation = decision.invocation.unwrap();
+    assert_eq!(invocation.liveness(), Liveness::Alive);
     assert!(!eligible(pid, &tty, &[]).unwrap().eligible);
     assert!(eligible(pid, Path::new("/dev/null"), &mappings).is_err());
     // SAFETY: pid is the live child owned by Job; SIGSTOP changes no parent memory.
@@ -89,6 +92,17 @@ fn mapped_foreground_job_on_separate_pty_and_stopped_job() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(!eligible(pid, &tty, &mappings).unwrap().eligible);
+    assert_eq!(invocation.liveness(), Liveness::Alive);
+    // Leave the child unreaped so zombie metadata also counts as an ended invocation.
+    job.0.kill().unwrap();
+    let deadline = Instant::now();
+    while invocation.liveness() != Liveness::Exited {
+        assert!(deadline.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    job.0.wait().unwrap();
+    assert_eq!(invocation.liveness(), Liveness::Exited);
+    assert_eq!(confirm_missing(pid).unwrap(), None);
 }
 
 struct FixtureJob(Child);
@@ -337,10 +351,19 @@ fn same_group_helpers_use_fd_metadata_not_names_or_arguments() {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let mut invocation = None;
         for _ in 0..if mode == "churn" { 10 } else { 1 } {
             let decision = eligible(job.0.id(), &tty, &mappings)
                 .unwrap_or_else(|error| panic!("{mode}: {error:#}"));
             assert_eq!(decision.eligible, expected, "{mode}: {}", decision.reason);
+            assert_eq!(decision.invocation.is_some(), expected);
+            if let Some(current) = decision.invocation {
+                assert_eq!(current.liveness(), Liveness::Alive);
+                if let Some(previous) = invocation {
+                    assert_eq!(current, previous);
+                }
+                invocation = Some(current);
+            }
         }
         let snapshot = snapshot(
             job.0.id(),

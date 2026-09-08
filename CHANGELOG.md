@@ -5,7 +5,51 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+### Generated Integration Layout
+
+- Store generated shell/tmux scripts under the XDG data directory instead of the
+  config directory. `config.json` remains optional user configuration.
+- Plain reinstall migrates intact legacy scripts and exact previously managed
+  startup references transactionally. Preserve unrelated startup bytes, modes,
+  and user settings; refuse edited, missing, or unowned migration targets.
+- Manifest format 2 records the new layout. Current management commands read
+  formats 1 and 2; binary rollback does not reverse the filesystem migration.
+
+### JSON Configuration And Runtime Contract
+
+- Configuration is JSON-only at
+  `${XDG_CONFIG_HOME:-$HOME/.config}/agent-float-term/config.json`. The public
+  field is `shortcut`, default F7; width and height default to 80 and accept
+  integer percentages from 10 to 100 inclusive. Unknown fields are rejected.
+- Advanced `shell` and `harness_paths`, executable/security validation, private
+  directories, and XDG behavior remain. TOML and unused transitive dependencies
+  are removed. There is no TOML fallback or automatic file migration: an old file
+  is preserved; if JSON is absent, an actionable error explains conversion and
+  the `key` to `shortcut` rename. Existing JSON is authoritative.
+- Converted every existing Expect config-format fixture, including the F7
+  benchmark, invalid-field test, and custom-shortcut test, to JSON. Seven focused
+  config unit tests pass locally; smoke/benchmark runtime reruns remain separate.
+- Shortened README; detailed installation, configuration, commands, safety, and
+  operational guidance live under `docs/`.
+- tmux minimum is now 3.4; floats belong to verified individual AI invocations
+  and reset on AI exit, including while hidden. A lightweight watcher checks
+  process identity every 100 ms without treating suspension as exit.
+  Main-terminal shortcuts control the main terminal;
+  navigating back to the original AI pane restores a temporarily hidden float.
+  Explicit F7 hide disables restoration until reopened.
+- Updated PTY scenarios cover main root/prefix/prefix2/custom-table shortcuts,
+  session/window restoration, prompt protection, visible/hidden AI termination,
+  background jobs, fresh invocations, and explicit-hide suppression. The new
+  minimum CI archive is SHA-256-pinned. See [current validation](docs/compatibility.md#current-change-validation)
+  for tested platforms and remaining release/deployment limits.
+- Disable timing-based paste guessing only inside the float so rapid keyboard
+  shortcuts cannot bypass routing on older supported tmux versions. Preserve
+  bracketed paste and the main terminal's options. Correct the theme test decoder
+  for empty SGR reset and saved rendition across capture boundaries.
+
 ### F7 Latency And Terminal Theme
+
+The following sections record earlier work, before the JSON/runtime contract.
 
 - Batched runtime metadata and guarded mutations reduce warm-open tmux
   invocations from 17 to 7, and post-hide worker cleanup from 3 to 1. Latest cold
@@ -94,7 +138,8 @@ evidence that the implementation or compatibility testing is complete.
   conservative foreground detection, and explicit orphan cleanup.
 - Preview-first installation; existing-server binding and an optional dedicated
   tmux environment that starts a normal shell.
-- XDG TOML configuration for key, popup dimensions, shell, and harness paths.
+- Initially XDG TOML configuration for key, popup dimensions, shell, and harness
+  paths; superseded by the JSON-only change above.
 - Diagnostics, session inspection, explicit local SHA-256-verified updates,
   rollback, and managed uninstall.
 - MIT licensing, contribution/security guidance, pinned Linux/macOS CI, and

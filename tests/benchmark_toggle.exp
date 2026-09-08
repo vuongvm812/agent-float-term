@@ -135,8 +135,9 @@ set failed [catch {
     set claude [file join $root bin claude]
     exec /usr/bin/cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
     set env(PATH) "[file join $root bin]:$env(PATH)"
-    write_private [file join $env(XDG_CONFIG_HOME) agent-float-term config.toml] \
-        "shell = '/bin/bash'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    write_private [file join $env(XDG_CONFIG_HOME) agent-float-term config.json] \
+        [format {{"shell":"/bin/bash","harness_paths":[{"harness":"claude","path":"%s"}]}} \
+            [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $claude]]
     # Interactive, non-login Bash reads only our empty HOME's startup files.
     write_private [file join $env(HOME) .bashrc] {PS1='AFT_BENCH_PROMPT> '; unset PROMPT_COMMAND}
     set log [file join $root rpc.log]

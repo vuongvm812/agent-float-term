@@ -88,6 +88,15 @@ enum Command {
         #[arg(long)]
         key: String,
     },
+    #[command(hide = true)]
+    Watch {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        instance: String,
+    },
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -124,6 +133,11 @@ fn run(cli: Cli) -> Result<()> {
             client_pid,
             key,
         } => tmux::dispatch(socket, pane, client_pid, key),
+        Command::Watch {
+            socket,
+            session,
+            instance,
+        } => tmux::watch(socket, session, instance),
     }
 }
 

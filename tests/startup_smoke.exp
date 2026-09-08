@@ -107,8 +107,8 @@ set failed [catch {
     set config_dir [file join $env(XDG_CONFIG_HOME) agent-float-term]
     file mkdir $config_dir
     file attributes $config_dir -permissions 0700
-    set out [open [file join $config_dir config.toml] {WRONLY CREAT EXCL} 0600]
-    puts $out "shell = '$shell'"
+    set out [open [file join $config_dir config.json] {WRONLY CREAT EXCL} 0600]
+    puts $out [format {{"shell":"%s"}} [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $shell]]
     close $out
     set dedicated [file join $env(XDG_RUNTIME_DIR) agent-float-term-[exec id -u]]
     set socket [file join $dedicated tmux.sock]

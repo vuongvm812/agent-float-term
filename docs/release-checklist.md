@@ -1,15 +1,44 @@
 # Release Checklist
 
-**Current status: locally validated for source use; publication checks remain.**
+**Current status: refactor locally tested; publication checks remain pending.**
+The minimum is now tmux **3.4**. Current macOS core PTY tests pass on 3.4, 3.5a,
+and 3.7c. Current results are recorded separately from the historical work below.
 Earlier macOS ARM64 release/packaged-engine and Debian 12 aarch64 reruns passed.
-The latest Linux Rust suite passed 57 tests; macOS passed 59 tests and all four
+The earlier Linux Rust suite passed 57 tests; macOS passed 59 tests and all four
 release-binary smoke suites. Latest packaged-archive acceptance remains pending. Theme smoke passed
 on Linux tmux 3.3a and macOS 3.5a/3.7c. Claude, OpenCode, and Codex have earlier
 no-model smoke coverage. See the
 [compatibility matrix](compatibility.md) for exact versions, counts, and limits.
 No commit, remote GitHub CI run, or release publication has been performed.
 
-## Latest Local Evidence
+## Current Change Acceptance
+
+- [x] JSON-only configuration: seven focused config unit tests passed with Rust
+  1.84.1; defaults, `shortcut`, dimension boundaries, advanced paths, legacy-file
+  preservation, security checks, and XDG semantics covered.
+- [x] Remove TOML dependency and unused lockfile packages; convert existing
+  Expect config-format fixtures to JSON. Six Tcl fixture expressions round-trip
+  through JSON parsing, including quote/backslash paths and custom shortcuts.
+  This is not a smoke/benchmark pass.
+- [x] Enforce tmux 3.4, update the CI minimum lane/archive pin, and run the core
+  PTY suite on private 3.4, 3.5a, and 3.7c servers on macOS.
+- [x] Verify reset when the owning AI invocation exits, both visible
+  and hidden; next invocation in the same pane must create a fresh float.
+- [x] Verify main-terminal shortcuts act on the main terminal, temporary hiding
+  during navigation, and automatic restoration only on return to the original
+  still-active AI pane. F7 hide must disable restoration until reopened.
+- [x] Cover command prompts, rapid custom-table input, multiple clients, process
+  replacement, visible/hidden exit, terminal jobs and stop/resume in PTY tests.
+- [x] Update installer preservation wording; run 75 macOS Rust tests and the
+  four JSON-based smoke suites. Linux ARM64 test-target cross-check passes.
+- [x] Migrate generated scripts into the data directory and update exact managed
+  references. The local migration passed doctor without restarting tmux.
+- [ ] Rerun current Linux runtime tests, refresh toggle benchmarks, and accept
+  packaged archives before publication.
+
+## Historical Latency/Theme Evidence
+
+These checked items predate the JSON and runtime-contract changes.
 
 - [x] Latest Linux Rust suite: 57 passed (50 library + 2 CLI + 1 installer +
   4 tmux-client). This is not native x86_64 release-artifact or GitHub CI evidence.
@@ -125,10 +154,11 @@ Builds are native, not cross-compiled:
 Runner host architecture is checked before packaging. Linux ARM64 stays
 source-build-only despite Debian local validation; no native ARM64 artifact lane
 has been added. Linux packaging remains Ubuntu 22.04 / glibc 2.35 baseline.
-Reusable CI now has two Linux lanes (checksum-pinned tmux 3.3a and 3.7c) plus
+CI has two Linux lanes (checksum-pinned tmux 3.4 and 3.7c) plus
 the two macOS lanes (Homebrew tmux, actual version logged). It installs Linux
 test/build dependencies including procps, `cc`, bash, and zsh. Source tmux goes
 only into the runner's temporary prefix; it is not included in release archives.
+Local minimum-version checks do not substitute for a successful remote matrix.
 
 `bash scripts/package-release.sh TAG TARGET [OUTPUT_DIRECTORY]` checks tag/package-version equality
 and the native host, builds the release binary, and writes
@@ -155,7 +185,8 @@ local macOS ARM64 archive. Local fixture/CLI self-management checks also do not
 substitute for installing and updating from each published platform archive.
 
 - [ ] Confirm tag and source commit match the reviewed source. Do not move tags.
-- [ ] Confirm all three archives and `SHA256SUMS` exist and names match README.
+- [ ] Confirm all three archives and `SHA256SUMS` exist and names match
+  [installation details](installation.md#release-archives).
 - [ ] Inspect archive contents: only binary, LICENSE, README; no `.codegraph/`,
   config, prompts, credentials, source checkout, or hidden local files.
 - [ ] Download each archive onto the corresponding platform, verify its archive

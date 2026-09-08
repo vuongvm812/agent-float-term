@@ -30,7 +30,7 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            tmux: 3.3a
+            tmux: '3.4'
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             tmux: 3.7c

@@ -60,7 +60,7 @@ proc type {text} {
 proc f7 {} { type "\033\[18~" }
 proc binding {{key F7}} {
     foreach line [split [tm list-keys] \n] {
-        if {[regexp {^bind-key +(?:-r +)?-T +root +([^ ]+) +} $line ignored actual] && $actual eq $key} { return $line }
+        if {[regexp {^bind-key +(?:-r +)?-T +root +([^ ]+) +(.*)$} $line ignored actual body] && $actual eq $key} { return "root $actual $body" }
     }
     return ""
 }
@@ -168,8 +168,10 @@ set failed [catch {
     set config_dir [file join $env(XDG_CONFIG_HOME) agent-float-term]
     file mkdir $config_dir
     file attributes $config_dir -permissions 0700
-    set config [file join $config_dir config.toml]
-    set valid_config "shell = '$shell'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    set config [file join $config_dir config.json]
+    set valid_config [format {{"shortcut":"F7","shell":"%s","harness_paths":[{"harness":"claude","path":"%s"}]}} \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $shell] \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $claude]]
     write_private $config $valid_config
 
     set help [exec $binary --help]
@@ -188,6 +190,10 @@ if {!$failed} {
         tm set-option -g status off
         # A zero timeout can split F7 across the nested PTYs under scheduler load.
         tm set-option -g escape-time 100
+        tm set-option -t outer prefix2 C-a
+        tm bind-key -n M-n new-window -n root-shortcut
+        tm bind-key -T prefix t switch-client -T fixture-modal
+        tm bind-key -T fixture-modal c new-window -n modal-shortcut
         set outer [tm display-message -p -t outer: {#{pane_id}}]
         set outer_pid [tm display-message -p -t $outer {#{pane_pid}}]
         # Leave this shadow in place through popup reuse, cleanup, and uninstall.
@@ -298,6 +304,55 @@ if {!$failed} {
         type "\r"
         eventually {contains $float "AFT_STATE_kept:$root"} "float variable and cwd persist"
         job_alive $worker_job
+        set origin_session [tm display-message -p -t $outer {#{session_id}}]
+        set origin_window [tm display-message -p -t $outer {#{window_id}}]
+        set origin_client [tm show-options -qv -t $float @aft_origin_name]
+        # Prefix and command arrive in a single PTY write, not delayed send-keys.
+        type "\002c"
+        eventually {expr {[clients] == 1 && [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]] == 2}} "prefix+c creates a MAIN window"
+        check {[llength [split [tm list-windows -t $float_session -F {#{window_id}}] \n]] == 1} "shortcut created a window inside float"
+        type "\002p"
+        eventually {expr {[clients] == 2}} "return to original main window restores float automatically"
+        check {[float_for $outer] eq $float} "window switching replaced the float"
+        type "\001c"
+        eventually {expr {[clients] == 1 && [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]] == 3}} "prefix2 creates a MAIN window"
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore after prefix2 window switch"
+        type "\033n"
+        eventually {expr {[clients] == 1 && [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]] == 4}} "root shortcut creates a MAIN window"
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore after root shortcut"
+        type "\002tc"
+        eventually {expr {[clients] == 1 && [llength [split [tm list-windows -t $origin_session -F {#{window_id}}] \n]] == 5}} "rapid custom key-table sequence operates on MAIN"
+        tm select-window -t $origin_window
+        eventually {expr {[clients] == 2}} "restore after custom key-table shortcut"
+        type "\002:"
+        eventually {expr {[clients] == 1}} "main command prompt takes focus"
+        after 1500
+        check {[clients] == 1} "automatic restoration interrupted the main prompt"
+        type "new-session -s routed-main\r"
+        eventually {expr {[tm display-message -p -c $origin_client {#{session_name}}] eq "routed-main"}} "main prompt creates and selects a MAIN session"
+        check {[clients] == 1} "float followed client into a different session"
+        tm switch-client -c $origin_client -t $origin_session
+        eventually {expr {[clients] == 2}} "return to original session restores the original float"
+        check {[float_for $outer] eq $float} "session switching moved or replaced the float"
+        tm switch-client -c $origin_client -t routed-main
+        eventually {expr {[clients] == 1}} "external session change detaches only the owned viewer"
+        tm switch-client -c $origin_client -t $origin_session
+        eventually {expr {[clients] == 2}} "restore after external session navigation"
+        f7
+        eventually {expr {[clients] == 1}} "explicit F7 hides restored float"
+        tm switch-client -c $origin_client -t routed-main
+        tm switch-client -c $origin_client -t $origin_session
+        after 1500
+        check {[clients] == 1} "explicitly hidden float restored unexpectedly"
+        # Remove only the extra fixture windows/sessions before the old scenarios.
+        tm kill-session -t routed-main
+        foreach window [split [tm list-windows -t $origin_session -F {#{window_id}}] \n] {
+            if {$window ne $origin_window} { tm kill-window -t $window }
+        }
+        f7
+        eventually {expr {[clients] == 2}} "manual reopen after session-switch tests"
         type "nvim\r"
         eventually {contains $float "AFT_READY nvim"} "editor in floating shell"
         check {[regexp {AFT_READY nvim pid=([0-9]+)} [screen $float] ignored editor_pid]} "editor PID missing"
@@ -332,6 +387,8 @@ if {!$failed} {
         type {printf 'AFT_FRESH_%s\n' "${AFT_VALUE-unset}"; AFT_VALUE=first}
         type "\r"
         eventually {contains $float AFT_FRESH_unset} "new float has fresh shell state"
+        type "sleep 120 & printf 'AFT_BG_PID_%s\\n' \$!\r"
+        eventually {expr {[regexp {AFT_BG_PID_([0-9]+)} [screen $float] ignored background_pid]}} "float background job started"
 
         set viewer_before [tm list-clients -t $float_session -F {#{client_pid}}]
         spawn -noecho $tmux -S $socket attach-session -t outer
@@ -350,22 +407,51 @@ if {!$failed} {
         check {[tm list-clients -t $float_session -F {#{client_pid}}] eq $viewer_before} "second client took over the float"
         type "printf 'AFT_VIEWER_%s\\n' ORIGINAL\r"
         eventually {contains $float AFT_VIEWER_ORIGINAL} "original viewer retains keyboard ownership"
+        set first_client $client
+        f7
+        eventually {expr {[clients] == 2}} "original viewer voluntarily hides"
+        set client $second_client
+        f7
+        eventually {expr {[clients] == 3}} "second client opens the retained float after release"
+        type "\002c"
+        eventually {expr {[clients] == 2}} "second client's shortcut targets main"
+        type "\002p"
+        eventually {expr {[clients] == 3}} "automatic restoration follows the NEW opener, not the old client"
+        f7
+        eventually {expr {[clients] == 2}} "second viewer hides"
+        set client $first_client
+        f7
+        eventually {expr {[clients] == 3}} "original client can reopen after handoff"
+        foreach window [split [tm list-windows -t $origin_session -F {#{window_id}}] \n] {
+            if {$window ne $origin_window} { tm kill-window -t $window }
+        }
         send -i $second_client -- "\002d"
         expect -i $second_client -timeout 15 eof {} timeout {error "second client did not detach"}
         wait -i $second_client
         set extra_clients {}
         f7
         eventually {expr {[clients] == 1}} "hide after contention"
+        exec kill -STOP [lindex $worker_job 0]
+        after 400
+        tm has-session -t $float_session
+        type "fg\r"
+        eventually {expr {[string first + [exec ps -p [lindex $worker_job 0] -o stat=]] >= 0}} "resume stopped AI in foreground"
 
         # A nested interactive shell is still a valid ancestry chain, not a wrapper.
-        type q
+        type "q\r"
         eventually {contains $outer "AFT_WORKERS_REAPED count=3"} "normal harness exit reaps all workers"
         eventually {job_gone $worker_job} "original harness and workers exited"
+        eventually {catch {tm has-session -t $float_session}} "AI exit destroys hidden float without another F7"
+        eventually {job_gone [list $background_pid]} "AI exit terminates the float's background job"
         # A killed parent cannot leave helpers blocked forever on inherited writers.
         launch $outer {AFT_TEST_WORKERS=3 claude} claude
         set killed_job [worker_job $outer]
+        f7
+        eventually {expr {[clients] == 2}} "open float before AI is killed"
+        set killed_float_session [tm display-message -p -t [float_for $outer] {#{session_name}}]
         exec kill -KILL [lindex $killed_job 0]
         eventually {job_gone $killed_job} "workers exit on EOF when their parent dies"
+        eventually {expr {[clients] == 1 && [catch {tm has-session -t $killed_float_session}]}} "AI death destroys the VISIBLE float"
         type "$shell --noprofile --norc -i\r"
         type "printf 'AFT_NESTED_%s\\n' READY\r"
         eventually {contains $outer AFT_NESTED_READY} "nested shell ready"
@@ -373,14 +459,25 @@ if {!$failed} {
         launch $outer claude claude
         f7
         eventually {expr {[clients] == 2}} "nested shell foreground harness opens float"
-        check {[float_for $outer] eq $float} "nested shell created a second float for the pane"
+        check {[float_for $outer] ne $float} "new invocation reused the previous float"
+        set float [float_for $outer]
+        set float_session [tm display-message -p -t $float {#{session_name}}]
         f7
         eventually {expr {[clients] == 1}} "hide nested-shell float"
         type q
-        after 200
+        eventually {catch {tm has-session -t $float_session}} "nested invocation exit resets its float"
         type "exit\r"
         after 200
         launch $outer claude claude
+        f7
+        eventually {expr {[clients] == 2}} "new original-pane invocation opens fresh float"
+        set float [float_for $outer]
+        set float_pid [tm display-message -p -t $float {#{pane_pid}}]
+        set float_session [tm display-message -p -t $float {#{session_name}}]
+        type "AFT_VALUE=first; printf 'AFT_NEW_%s\\n' READY\r"
+        eventually {contains $float AFT_NEW_READY} "replacement float accepts state"
+        f7
+        eventually {expr {[clients] == 1}} "hide replacement float"
 
         set second_pane [tm new-window -d -P -F {#{pane_id}} -t outer -n second -c $env(HOME) $shell --noprofile --norc -i]
         tm select-window -t outer:second
@@ -411,6 +508,9 @@ if {!$failed} {
         set foreign_pid [tm display-message -p -t $foreign {#{pane_pid}}]
         tm rename-session -t $second_session {orphan|float}
         set second_session {orphan|float}
+        # Simulate a legacy float without invocation metadata. These are preserved
+        # for explicit cleanup rather than being adopted by an exit watcher.
+        tm set-option -t $second_session @aft_invocation ""
         tm kill-pane -t $second_pane
         set listing [exec $binary sessions --socket $socket 2>@1]
         check {[string first "$second_session\towner=$second_pane\tviewers=0\torphan" $listing] >= 0} "orphan not listed"
@@ -430,7 +530,7 @@ if {!$failed} {
         set doctor [exec $binary doctor --socket $socket]
         check {[string first "Owned key binding: intact" $doctor] >= 0} "pane-local generation broke doctor ownership: $doctor"
 
-        write_private $config {width = 'invalid'}
+        write_private $config {{"width":"invalid"}}
         f7
         eventually {contains $outer "AFT_KEY claude count=1"} "invalid config forwards F7"
         check {[clients] == 1} "invalid config opened a popup"
@@ -465,7 +565,7 @@ if {!$failed} {
         check {$alias_key in {C-i Tab}} "C-i binding was not serialized as C-i or Tab"
         set original_alias [binding $alias_key]
         set original_tab [binding Tab]
-        write_private $config "key = 'C-i'\n$valid_config"
+        write_private $config [string map [list {"shortcut":"F7"} {"shortcut":"C-i"}] $valid_config]
         check {[catch {exec $binary bind --socket $socket 2>@1}]} "C-i bypassed the $alias_key key collision"
         check {[binding $alias_key] eq $original_alias} "alias refusal modified $alias_key"
         exec $binary install --yes 2>@1
@@ -481,6 +581,7 @@ if {$failed} {
     puts stderr "PTY smoke FAILED: $message"
     if {[dict exists $options -errorinfo]} { puts stderr [dict get $options -errorinfo] }
     if {$socket ne "" && [file exists $socket]} {
+        catch {puts stderr "last AFT error: [tm show-options -gqv @aft_last_error]"}
         catch {puts stderr "clients: [tm list-clients]"}
         catch {
             foreach binding [split [tm list-keys] \n] {
@@ -502,4 +603,4 @@ if {$failed} {
 }
 teardown
 if {$failed} { exit 1 }
-puts "PTY smoke passed: scope, worker-backed popup/PID persistence/EOF cleanup, persistence/rename/exit, pane isolation, contention, orphans, fallback, binding ownership/aliases, pane-local generation shadow, incompatible policy refusal"
+puts "PTY smoke passed: invocation reset, visible/hidden exit and jobs, main shortcuts/custom tables, session restoration, prompt protection, F7 hiding, scope, persistence, contention, legacy cleanup, binding ownership"

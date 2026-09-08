@@ -42,6 +42,11 @@ fn actual_payload_install_update_rollback_and_uninstall() {
     assert!(success(invoke(binary, home, &["install"])).contains("Preview only"));
     assert!(!home.join("state").exists());
     success(invoke(binary, home, &["install", "--yes"]));
+    assert!(home.join("data/agent-float-term/integration.sh").is_file());
+    assert!(home
+        .join("data/agent-float-term/integration.tmux")
+        .is_file());
+    assert!(!home.join("config/agent-float-term").exists());
     assert_eq!(
         success(invoke(&installed, home, &["--version"])).trim(),
         expected
@@ -84,4 +89,79 @@ fn actual_payload_install_update_rollback_and_uninstall() {
     success(invoke(&installed, home, &["uninstall", "--yes"]));
     assert!(!installed.exists());
     success(invoke(binary, home, &["uninstall", "--yes"]));
+}
+
+#[test]
+fn actual_installer_migrates_legacy_layout_without_startup_flags() {
+    let temp = tempfile::Builder::new()
+        .prefix("aft migration ")
+        .tempdir()
+        .unwrap();
+    let home = temp.path();
+    let binary = Path::new(env!("CARGO_BIN_EXE_agent-float-term"));
+    let rc = home.join(".zshrc");
+    let data = home.join("data/agent-float-term");
+    let config = home.join("config/agent-float-term");
+    let manifest = home.join("state/agent-float-term/install.json");
+    fs::write(&rc, "# user setting\n").unwrap();
+    success(invoke(
+        binary,
+        home,
+        &[
+            "install",
+            "--shell-config",
+            rc.to_str().unwrap(),
+            "--shell-kind",
+            "zsh",
+            "--yes",
+        ],
+    ));
+
+    fs::create_dir_all(&config).unwrap();
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    legacy["format"] = 1.into();
+    for file in legacy["files"].as_array_mut().unwrap() {
+        let source = std::path::PathBuf::from(file["path"].as_str().unwrap());
+        let target = config.join(source.file_name().unwrap());
+        fs::rename(source, &target).unwrap();
+        file["path"] = target.to_str().unwrap().into();
+    }
+    let block = legacy["blocks"][0]["text"]
+        .as_str()
+        .unwrap()
+        .replace(data.to_str().unwrap(), config.to_str().unwrap());
+    legacy["blocks"][0]["text"] = block.clone().into();
+    fs::write(
+        &rc,
+        format!("# user setting\n{block}# appended user setting\n"),
+    )
+    .unwrap();
+    fs::write(&manifest, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+    fs::write(config.join("config.json"), "{\"height\":60}").unwrap();
+    let before = fs::read(&rc).unwrap();
+    let preview = success(invoke(binary, home, &["install"]));
+    assert!(preview.contains("Migrate legacy layout"));
+    assert_eq!(fs::read(&rc).unwrap(), before);
+    success(invoke(binary, home, &["install", "--yes"]));
+    let current: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(current["format"], 2);
+    assert_eq!(current["shell_kind"], "zsh");
+    assert!(data.join("integration.sh").is_file());
+    assert!(data.join("integration.tmux").is_file());
+    assert!(!config.join("integration.sh").exists());
+    assert!(!config.join("integration.tmux").exists());
+    let migrated = fs::read_to_string(&rc).unwrap();
+    assert!(migrated.contains(data.join("integration.sh").to_str().unwrap()));
+    assert!(migrated.starts_with("# user setting\n"));
+    assert!(migrated.ends_with("# appended user setting\n"));
+    success(invoke(binary, home, &["uninstall", "--yes"]));
+    assert_eq!(
+        fs::read_to_string(&rc).unwrap(),
+        "# user setting\n# appended user setting\n"
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("config.json")).unwrap(),
+        "{\"height\":60}"
+    );
 }

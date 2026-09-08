@@ -19,6 +19,7 @@ pub struct HarnessMapping {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    #[serde(rename = "shortcut")]
     pub key: String,
     pub width: u8,
     pub height: u8,
@@ -44,7 +45,7 @@ impl Config {
         let mut modifiers = HashSet::new();
         while key.starts_with("C-") || key.starts_with("M-") || key.starts_with("S-") {
             if !modifiers.insert(&key[..2]) {
-                bail!("duplicate key modifier");
+                bail!("duplicate shortcut modifier");
             }
             key = &key[2..];
         }
@@ -74,7 +75,7 @@ impl Config {
                     | "IC"
             ))
         {
-            bail!("key must be a safe tmux key (for example F7, C-a, or M-Space)");
+            bail!("shortcut must be a safe tmux key (for example F7, C-a, or M-Space)");
         }
         if !(10..=100).contains(&self.width) || !(10..=100).contains(&self.height) {
             bail!("width and height must each be between 10 and 100");
@@ -156,7 +157,7 @@ impl Paths {
 }
 
 pub fn load() -> Result<Config> {
-    load_file(&Paths::discover()?.config.join("config.toml"))
+    load_file(&Paths::discover()?.config.join("config.json"))
 }
 
 fn load_file(path: &Path) -> Result<Config> {
@@ -181,6 +182,22 @@ fn load_file(path: &Path) -> Result<Config> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy = path.with_file_name("config.toml");
+            match fs::symlink_metadata(&legacy) {
+                Ok(_) => bail!(
+                    "{} is no longer supported and was left unchanged; create {} as a JSON object, \
+                     rename 'key' to 'shortcut', and convert any shell/harness_paths settings; \
+                     use {{}} for defaults. TOML is not loaded",
+                    legacy.display(),
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect legacy configuration {}", legacy.display())
+                    });
+                }
+            }
             return Ok(Config::default());
         }
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
@@ -194,7 +211,19 @@ fn load_file(path: &Path) -> Result<Config> {
     if text.len() > 1024 * 1024 {
         bail!("configuration exceeds 1 MiB");
     }
-    let config: Config = toml::from_str(&text).context("invalid config.toml")?;
+    // Serde's struct deserializer also accepts positional arrays; config is object-only.
+    if !text.trim_start().starts_with('{') {
+        bail!(
+            "invalid config.json at {}; expected a JSON object",
+            path.display()
+        );
+    }
+    let config: Config = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "invalid config.json at {}; expected a JSON object",
+            path.display()
+        )
+    })?;
     config.validate()?;
     Ok(config)
 }
@@ -278,11 +307,54 @@ mod tests {
 
     #[test]
     fn defaults_unknown_fields_and_validation() {
-        let config: Config = toml::from_str("").unwrap();
+        let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.key, "F7");
         assert_eq!((config.width, config.height), (80, 80));
         config.validate().unwrap();
-        assert!(toml::from_str::<Config>("widht = 80").is_err());
+        for text in [
+            r#"{"widht":80}"#,
+            r#"{"key":"F7"}"#,
+            r#"{"shortcut":"F7","shortcut":"F8"}"#,
+            r#"{"width":"80"}"#,
+            r#"{"width":80.5}"#,
+            r#"{"height":-1}"#,
+            r#"{"height":256}"#,
+            r#"{"shortcut":"F7",}"#,
+            "",
+            "width = 80",
+        ] {
+            assert!(serde_json::from_str::<Config>(text).is_err(), "{text:?}");
+        }
+        let config: Config =
+            serde_json::from_str(r#"{"shortcut":"C-a","width":10,"height":100}"#).unwrap();
+        assert_eq!(config.key, "C-a");
+        config.validate().unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["shortcut"], "C-a");
+        assert!(json.get("key").is_none());
+        let partial: Config = serde_json::from_str(r#"{"height":10}"#).unwrap();
+        assert_eq!((partial.width, partial.height), (80, 10));
+        assert_eq!(partial.key, "F7");
+        for dimension in [0, 9, 101, 255] {
+            for (width, height) in [(dimension, 80), (80, dimension)] {
+                assert!(Config {
+                    width,
+                    height,
+                    ..Config::default()
+                }
+                .validate()
+                .is_err());
+            }
+        }
+        for dimension in [10, 100] {
+            Config {
+                width: dimension,
+                height: dimension,
+                ..Config::default()
+            }
+            .validate()
+            .unwrap();
+        }
         for key in [
             "F7; run-shell bad",
             "#{pane_id}",
@@ -341,13 +413,18 @@ mod tests {
             harness: "claude".into(),
             path: executable.clone(),
         };
-        Config {
+        let config = Config {
             shell: Some(executable.clone()),
             harness_paths: vec![mapping.clone()],
             ..Config::default()
-        }
-        .validate()
-        .unwrap();
+        };
+        let path = temp.path().join("config.json");
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let loaded = load_file(&path).unwrap();
+        assert_eq!(loaded.shell, config.shell);
+        assert_eq!(loaded.harness_paths[0].path, executable);
+        assert_eq!(loaded.harness_paths[0].harness, "claude");
+        fs::remove_file(&path).unwrap();
         assert!(Config {
             harness_paths: vec![HarnessMapping {
                 harness: "unknown".into(),
@@ -370,9 +447,8 @@ mod tests {
         }
         .validate()
         .is_err());
-        let path = temp.path().join("config.toml");
         assert_eq!(load_file(&path).unwrap().key, "F7");
-        fs::write(&path, "height = 101").unwrap();
+        fs::write(&path, r#"{"height":101}"#).unwrap();
         assert!(load_file(&path).is_err());
         fs::remove_file(&path).unwrap();
         symlink("missing", &path).unwrap();
@@ -384,16 +460,70 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("product");
         private_dir(&directory).unwrap();
-        let path = directory.join("config.toml");
-        fs::write(&path, "key = 'F7'\n").unwrap();
+        let path = directory.join("config.json");
+        fs::write(&path, r#"{"shortcut":"F7"}"#).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(load_file(&path).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         load_file(&path).unwrap();
         let alias = temp.path().join("alias");
         symlink(&directory, &alias).unwrap();
-        assert!(load_file(&alias.join("config.toml")).is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"key = 'F7'\n");
+        assert!(load_file(&alias.join("config.json")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), br#"{"shortcut":"F7"}"#);
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(load_file(&path).is_err());
+    }
+
+    #[test]
+    fn json_only_preserves_legacy_files_and_reports_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        let legacy = temp.path().join("config.toml");
+        let old_text = "key = 'F8'\nwidth = 70\n";
+        fs::write(&legacy, old_text).unwrap();
+        let error = load_file(&path).unwrap_err().to_string();
+        assert!(error.contains("config.toml"));
+        assert!(error.contains(&format!("create {}", path.display())));
+        assert!(error.contains("'key' to 'shortcut'"));
+        assert!(!path.exists());
+        fs::write(&path, r#"{"shortcut":"F9"}"#).unwrap();
+        assert_eq!(load_file(&path).unwrap().key, "F9");
+        fs::write(&path, old_text).unwrap();
+        assert!(load_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid config.json"));
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), old_text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), old_text);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&legacy).unwrap();
+        symlink("missing", &legacy).unwrap();
+        assert!(load_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("TOML is not loaded"));
+        assert_eq!(fs::read_link(&legacy).unwrap(), Path::new("missing"));
+    }
+
+    #[test]
+    fn oversized_and_nonregular_json_are_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        for text in ["[]", r#"["F7",80,80,null,[]]"#, "null", "true", ""] {
+            fs::write(&path, text).unwrap();
+            assert!(load_file(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("expected a JSON object"));
+        }
+        fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+        assert!(load_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 1 MiB"));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(load_file(&path).is_err());
     }
 
     #[test]

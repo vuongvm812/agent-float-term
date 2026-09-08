@@ -1,6 +1,6 @@
 #!/usr/bin/env expect
 # expect tests/theme_smoke.exp /path/to/agent-float-term
-# Select a real tmux (>= 3.3a) with PATH. PTY color semantics, NOT OS opacity.
+# Select a real tmux (>= 3.4) with PATH. PTY color semantics, NOT OS opacity.
 set timeout 15
 log_user 0
 if {$argc != 1} { puts stderr "usage: expect tests/theme_smoke.exp /path/to/agent-float-term"; exit 1 }
@@ -16,6 +16,7 @@ set root ""
 set socket ""
 set client ""
 set stream ""
+set checkpoint 0
 proc check {condition message} {
     if {![uplevel 1 [list expr $condition]]} { error $message }
 }
@@ -51,12 +52,17 @@ proc globals {} {
 }
 # Only decode SGR and printable output, not a framebuffer. Ignore OSC, charset,
 # and cursor controls; retain a color pair for EVERY character in each marker.
-proc colors {marker foreground background} {
-    global stream
-    set fg default; set bg default; set text ""; set pairs {}; set seen 0
+proc colors {marker foreground background {latest 0}} {
+    global stream checkpoint
+    set fg default; set bg default; set saved [list default default]; set text ""; set pairs {}; set seen 0
+    set position 0
+    set last_pairs {}
     foreach token [regexp -all -inline {\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b.|[^\x1b]} $stream] {
+        incr position [string length $token]
         if {[regexp {^\x1b\[([0-9;:]*)m$} $token ignored parameters]} {
             set codes [split [string map {: ;} $parameters] {;}]
+            # An empty SGR parameter list is reset (CSI m), not a no-op.
+            if {$parameters eq ""} { set codes [list 0] }
             for {set i 0} {$i < [llength $codes]} {incr i} {
                 set code [lindex $codes $i]
                 if {$code eq "" || $code == 0} { set fg default; set bg default
@@ -74,19 +80,44 @@ proc colors {marker foreground background} {
                 } elseif {($code >= 30 && $code <= 37) || ($code >= 90 && $code <= 97)} { set fg "ansi:$code"
                 } elseif {($code >= 40 && $code <= 47) || ($code >= 100 && $code <= 107)} { set bg "ansi:$code" }
             }
+        } elseif {$token eq "\0337"} {
+            set saved [list $fg $bg]
+        } elseif {$token eq "\0338"} {
+            lassign $saved fg bg
         } elseif {[string index $token 0] ne "\033"} {
             append text $token
             lappend pairs [list $fg $bg]
             set text [string range $text end-[expr {[string length $marker] - 1}] end]
             set pairs [lrange $pairs end-[expr {[string length $marker] - 1}] end]
-            if {$text eq $marker} {
-                foreach pair $pairs { check {$pair eq [list $foreground $background]} "$marker: expected $foreground/$background, got $pair" }
+            if {$text eq $marker && $position > $checkpoint} {
+                set last_pairs $pairs
+                foreach pair [expr {$latest ? {} : $pairs}] {
+                    if {$pair ne [list $foreground $background]} {
+                        set context [string map [list "\033" {<ESC>} "\r" {<CR>} "\n" {<LF>}] [string range $stream [expr {max(0, $position - 300)}] $position]]
+                        error "$marker: expected $foreground/$background, got $pair; controls: $context"
+                    }
+                }
                 incr seen
             }
         }
     }
+    # Borders reuse the same glyphs across raw and owned popups. Assert the last
+    # completed border draw, not a delayed earlier popup redraw in the PTY queue.
+    if {$latest} {
+        foreach pair $last_pairs { check {$pair eq [list $foreground $background]} "$marker: latest border expected $foreground/$background, got $pair" }
+    }
     return [expr {$seen > 0}]
 }
+# Decoder regressions: preserve rendition across checkpoints, empty SGR resets,
+# and DEC cursor save/restore (which also saves/restores rendition).
+set stream "\033\[38;2;170;51;102;48;2;51;68;85mOLD"
+set checkpoint [string length $stream]
+append stream "\033\[mAFT_EMPTY_RESET"
+check {[colors AFT_EMPTY_RESET default default]} "empty SGR reset decoder"
+set stream "\033\[31m\0337\033\[32mGREEN\0338AFT_SAVED_RED"
+set checkpoint 0
+check {[colors AFT_SAVED_RED ansi:31 default]} "DEC rendition restore decoder"
+set stream ""; set checkpoint 0
 proc teardown {} {
     global root socket client tmux
     if {$socket ne "" && [file exists $socket]} { catch {exec $tmux -S $socket kill-server} }
@@ -113,8 +144,10 @@ set failed [catch {
     file attributes $binary -permissions 0700
     set claude $root/bin/claude
     exec cc -std=c99 -Wall -Wextra -Werror $fixture -o $claude
-    set out [open $env(XDG_CONFIG_HOME)/agent-float-term/config.toml {WRONLY CREAT EXCL} 0600]
-    puts $out "shell = '$shell'\n\[\[harness_paths\]\]\nharness = 'claude'\npath = '$claude'"
+    set out [open $env(XDG_CONFIG_HOME)/agent-float-term/config.json {WRONLY CREAT EXCL} 0600]
+    puts $out [format {{"shell":"%s","harness_paths":[{"harness":"claude","path":"%s"}]}} \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $shell] \
+        [string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $claude]]
     close $out
     set socket $env(TMUX_TMPDIR)/server
     tm -f /dev/null new-session -d -s outer -c $env(HOME) $shell --noprofile --norc -i
@@ -145,14 +178,16 @@ set failed [catch {
     eventually {contains $outer "AFT_READY claude"} "no-argument compiled claude fixture"
     eventually {colors AFT_OUTER_DEFAULT default default} "outer visible control"
     # A raw popup without -s/-S must expose the inherited RGB sentinels.
-    set stream ""
+    # Keep earlier SGR state: discarding a stream chunk can split a control
+    # sequence or lose an inherited color before the next redraw.
+    set checkpoint [string length $stream]
     set raw_pid [exec $tmux -S $socket display-popup -E -t $outer -w 80% -h 80% "printf '\\033\[0mAFT_RAW_%s\\n' DEFAULT; exec '$claude'" &]
     eventually {colors AFT_RAW_DEFAULT rgb:170,187,204 rgb:17,34,51} "raw popup negative control"
-    check {[colors ------ rgb:170,51,102 rgb:51,68,85]} "raw border sentinel not observed"
+    check {[colors ------ rgb:170,51,102 rgb:51,68,85 1]} "raw border sentinel not observed"
     type q
     eventually {expr {[catch {exec kill -0 $raw_pid 2>@1}]}} "raw popup closed"
     drain
-    set stream ""
+    set checkpoint [string length $stream]
     foreach opening {first reopen} {
         f7
         eventually {attached 2} "$opening popup"
@@ -172,7 +207,7 @@ set failed [catch {
         type "printf '\\033\[0mAFT_${opening}_%s\\n\\033\[38;2;12;34;56;48;2;65;43;21mAFT_${opening}_%s\\033\[0m\\n' DEFAULT RGB\r"
         eventually [list colors AFT_${opening}_DEFAULT default default] "$opening default content"
         eventually [list colors AFT_${opening}_RGB rgb:12,34,56 rgb:65,43,21] "$opening explicit RGB content"
-        check {[colors ------ default default]} "$opening terminal-default border not observed"
+        check {[colors ------ default default 1]} "$opening terminal-default border not observed"
         check {[globals] eq $before} "$opening changed global styles"
         check {[styles -w $outer] eq $outer_window && [styles -p $outer] eq $outer_pane} "$opening changed outer overrides"
         check {[tm display-message -p -t $outer {#{pane_id}|#{pane_pid}|#{window_id}}] eq $parent} "parent identity changed"
@@ -186,7 +221,7 @@ set failed [catch {
             foreach option {window-style window-active-style} { tm set-option $scope -t $float $option $sentinel }
         }
         drain
-        set stream ""
+        set checkpoint [string length $stream]
     }
     # A foreign link makes window-level writes unsafe: refuse before any style mutation.
     tm new-session -d -s foreign $shell --noprofile --norc -i

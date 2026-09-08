@@ -9,8 +9,8 @@ use anyhow::{ensure, Context, Result};
 use libc::{proc_bsdinfo as BsdInfo, proc_listpids, proc_pidinfo, proc_pidpath};
 
 use super::{
-    within_budget, Descriptors, ExecutableId, Identity, Input, MAX_ARGS, MAX_ARG_BYTES, MAX_FDS,
-    MAX_PROCESSES,
+    within_budget, Descriptors, ExecutableId, Identity, Input, Liveness, MAX_ARGS, MAX_ARG_BYTES,
+    MAX_FDS, MAX_PROCESSES,
 };
 
 // <libproc.h>; this selector is not exported by the pinned libc version.
@@ -142,7 +142,9 @@ pub(super) fn identity(pid: u32) -> Result<Option<Identity>> {
     let mut info = MaybeUninit::<BsdInfo>::uninit();
     // SAFETY: BsdInfo has the C ABI layout; the pointer has exactly the advertised
     // writable size. We read it only if libproc reports that the entire struct was filled.
+    // Clear this thread's errno so a zero result cannot inherit a stale ESRCH.
     let count = unsafe {
+        *libc::__error() = 0;
         proc_pidinfo(
             pid as i32,
             libc::PROC_PIDTBSDINFO,
@@ -155,6 +157,9 @@ pub(super) fn identity(pid: u32) -> Result<Option<Identity>> {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(None);
+        }
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return super::confirm_missing(pid);
         }
         return Err(error).context("cannot read process identity");
     }
@@ -175,6 +180,11 @@ pub(super) fn identity(pid: u32) -> Result<Option<Identity>> {
         started: (info.pbi_start_tvsec, info.pbi_start_tvusec),
         // <sys/proc.h>: SIDL=1, SRUN=2, SSLEEP=3, SSTOP=4, SZOMB=5.
         runnable: matches!(info.pbi_status, 2 | 3),
+        liveness: match info.pbi_status {
+            1..=4 => Liveness::Alive,
+            5 => Liveness::Exited,
+            _ => Liveness::Unknown,
+        },
     }))
 }
 

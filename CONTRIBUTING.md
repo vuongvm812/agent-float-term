@@ -7,7 +7,7 @@ bugs and focused feature proposals. For vulnerabilities, follow
 ## Development Setup
 
 Build with Rust **1.84.1**, edition **2021**. Runtime and PTY tests require
-**tmux 3.3a+**; tests also require **Expect**, a C compiler (`cc`), **bash**, and
+**tmux 3.4+**; tests also require **Expect**, a C compiler (`cc`), **bash**, and
 **zsh**. Linux tests need procps, including an external `/bin/kill`, not just a
 shell builtin. Install these dependencies in your chosen development or
 disposable test environment. CI installs them on its own runners. Do not change
@@ -33,7 +33,7 @@ entry points and the lockfile are release prerequisites; CI intentionally fails
 rather than skips a missing prerequisite.
 
 Ubuntu 22.04's default tmux 3.2a is too old. Linux CI instead builds official
-checksum-pinned tmux 3.3a and 3.7c in separate lanes using
+checksum-pinned tmux 3.4 and 3.7c in separate lanes using
 `bash scripts/install-ci-tmux.sh VERSION`. This script is restricted to Linux
 GitHub runners and installs only under `RUNNER_TEMP`, exporting through
 `GITHUB_PATH`; do not use it to change your host installation. macOS CI uses
@@ -134,7 +134,7 @@ detach-policy or ownership checks.
 
 ## Optional Benchmark
 
-After building, select an absolute path to a trusted tmux 3.3a+ executable:
+After building, select an absolute path to a trusted tmux 3.4+ executable:
 
 ```sh
 expect tests/benchmark_toggle.exp target/release/agent-float-term /absolute/path/to/tmux 5 5

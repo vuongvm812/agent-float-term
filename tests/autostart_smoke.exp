@@ -122,7 +122,7 @@ unsetopt zle prompt_cr prompt_sp
     set installed [file join $env(HOME) .local bin agent-float-term]
     check {[file executable $installed]} "installer did not publish its payload"
     check {[exec $installed --version] eq [exec $binary --version]} "installed payload version differs"
-    check {![file exists [file join $env(XDG_CONFIG_HOME) agent-float-term config.toml]]} "test must use default application configuration"
+    check {![file exists [file join $env(XDG_CONFIG_HOME) agent-float-term config.json]]} "test must use default application configuration"
     set observed [file join $env(HOME) rc-observed]
     # Only this disposable rc is sourced, never the real user's .zshrc.
     write_private [file join $env(ZDOTDIR) .zshrc] "source '$rc'\n[string trim {

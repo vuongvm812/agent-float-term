@@ -1,11 +1,50 @@
 # Compatibility And Validation
 
-The 0.1.0 candidate is implemented and validated for local source use on the
-combinations below. **Release publication checks remain.** No GitHub CI run or
-published release exists yet; local source and archive validation does not
-establish a completed remote matrix or public-download acceptance.
+**Current status: refactor implemented and locally PTY-tested on macOS.**
+The runtime minimum is **3.4**. Each float belongs to one AI invocation and is
+reset when it exits. Tmux keyboard shortcuts target the main terminal.
+Returning to the original AI pane restores a
+temporarily hidden float; explicit F7 hide disables restoration until reopened.
+Current evidence is separate from the historical results below.
 
-## Local Evidence
+No GitHub CI run or published release is recorded here. Local historical source
+and archive validation does not establish current runtime acceptance, a completed
+remote matrix, or public-download acceptance.
+
+## Current Change Validation
+
+| Change | Evidence | Still Needed |
+| --- | --- | --- |
+| Configuration, installer, and Rust APIs | 75 macOS tests passed, including legacy-layout migration and seven config tests; Linux ARM64 test-target cross-check passed | Current Linux runtime and remote CI acceptance |
+| Generated integration layout | Fresh install, Bash/Zsh migration, no-write preview, idempotency, byte/mode preservation, collision/edited-file refusal, and migrated uninstall passed; all four release smoke suites passed | Broader Linux runtime migration coverage |
+| JSON-based smoke fixtures | Release-binary core PTY and theme suites passed on macOS tmux 3.4, 3.5a, and 3.7c; release startup/autostart passed on 3.7c | Current packaged-archive acceptance and updated latency benchmark |
+| tmux 3.4 minimum | Enforced at runtime; core PTY suite passed on macOS 3.4, 3.5a, and 3.7c; CI minimum lane updated and archive hash verified | GitHub CI execution |
+| AI-invocation lifetime | Core PTY tests cover same-invocation state, fresh restart, visible/hidden termination, background-job cleanup, and stop/resume | Real authenticated AI exit scenarios; no daemonized-job containment claim |
+| Main shortcuts and restoration | Core PTY tests cover root, prefix, prefix2, rapid custom-table sequences, new main windows/sessions, return-to-origin restoration, prompt protection, explicit hide, and client contention | Broader terminal-emulator and arbitrary custom mouse/plugin behavior |
+
+Tests use private sockets, temporary configuration and synthetic CLI fixtures;
+they do not change the running OpenCode conversation or install into the live
+tmux server. Polling is best-effort: 100 ms liveness checks and approximately
+one-second restoration retries, not hard real-time guarantees.
+
+The minimum/reference release tests caught and fixed timing-based paste detection
+bypassing rapid custom-table shortcuts on 3.4/3.5a. Only the owned float disables
+that heuristic; bracketed paste keeps native handling. Theme coverage now retains
+SGR state across checkpoints and handles empty SGR reset and DEC saved rendition,
+rather than assuming each captured chunk starts with default colors.
+
+The generated-script layout was also applied to the local installation: scripts
+now live under the data directory, the exact managed `.zshrc` reference was
+updated, and the config directory contains no generated files. Read-only doctor
+reported valid defaults and an intact binding; the existing tmux 3.5a server PID
+was unchanged. This is not an authenticated/model-interaction test.
+
+## Historical Local Evidence
+
+All results in this section predate the JSON/invocation/navigation changes.
+"Latest" within these records refers to the preceding latency/theme work, not
+acceptance of the new contract. tmux 3.3a results remain historical evidence only;
+they do not lower the 3.4 minimum.
 
 ### Latest F7 Latency And Theme Work
 
@@ -147,7 +186,10 @@ in the 48/46 totals. It also caught and now guards macOS executable-symlink
 resolution during reinstall. None of these local tests is a download/install
 test of a published release.
 
-## CI Coverage
+## Recorded CI Coverage
+
+The configured minimum lane is now tmux 3.4. Local tests do not imply a GitHub
+Actions run; historical 3.3a source hashes remain below for reference only.
 
 The reusable CI workflow runs Rust 1.84.1 fmt, Clippy, Rust tests, debug/release
 builds, and core PTY, startup, autostart, and theme smoke entry points. Each smoke step
@@ -157,12 +199,12 @@ not CI dependencies; no benchmark latency threshold is enforced.
 
 | Runner | Architecture | tmux selection | Status |
 | --- | --- | --- | --- |
-| `ubuntu-22.04` | x86_64 | Official 3.3a archive, SHA-256 pinned, built in runner temp | Minimum-version lane configured; no GitHub run recorded |
+| `ubuntu-22.04` | x86_64 | Official 3.4 archive, SHA-256 pinned, built in runner temp | Minimum-version lane configured; no GitHub run recorded |
 | `ubuntu-22.04` | x86_64 | Official 3.7c archive, SHA-256 pinned, built in runner temp | Reference lane configured; no GitHub run recorded |
 | `macos-14` | ARM64 | Current Homebrew tmux; actual `tmux -V` recorded | Not version-pinned; no GitHub run recorded |
 | `macos-15-intel` | x86_64 | Current Homebrew tmux; actual `tmux -V` recorded | Not version-pinned; no GitHub run recorded |
 
-Ubuntu 22.04's packaged tmux 3.2a is below the required 3.3a minimum and is not
+Ubuntu 22.04's packaged tmux 3.2a is below the minimum and is not
 used as the test dependency. `scripts/install-ci-tmux.sh` accepts only the two
 pinned versions, verifies the archive **before extracting or building it**, and
 installs below `RUNNER_TEMP`. It appends the private binary directory to
@@ -181,12 +223,13 @@ tested source commit when recording a final result.
 The following official release assets were queried using the GitHub API and
 downloaded over HTTPS to compute their SHA-256.
 tmux 3.7c's computed value also matches its GitHub asset `digest`. GitHub exposes
-no digest for the older 3.3a asset, so that pin is the locally computed official
+no digest for the 3.3a and 3.4 assets, so those pins are locally computed official
 download hash, not a separately published upstream signature.
 
 | Official archive | SHA-256 | GitHub asset ID |
 | --- | --- | --- |
 | [tmux-3.3a.tar.gz](https://github.com/tmux/tmux/releases/download/3.3a/tmux-3.3a.tar.gz) | `e4fd347843bd0772c4f48d6dde625b0b109b7a380ff15db21e97c11a4dcdf93f` | `67990636` |
+| [tmux-3.4.tar.gz](https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz) | `551ab8dea0bf505c0ad6b7bb35ef567cdde0ccb84357df142c254f35a23e19aa` | `151288686` |
 | [tmux-3.7c.tar.gz](https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz) | `7c60cae9a0e25288e2e24750aafc9e8800fc7fd4555e447e1b29ee4201cfb3bf` | `518107178` |
 
 These pins detect archive changes, not compromise of the trusted upstream

@@ -1,7 +1,7 @@
 //! Pure /proc parser: fixtures also run on macOS.
 use anyhow::{ensure, Context, Result};
 
-use super::Identity;
+use super::{Identity, Liveness};
 
 pub(super) fn parse_stat(bytes: &[u8]) -> Result<Identity> {
     // comm may contain spaces, newlines, and ')' itself. The final ')' closes comm.
@@ -29,6 +29,11 @@ pub(super) fn parse_stat(bytes: &[u8]) -> Result<Identity> {
         foreground: if foreground > 0 { foreground as u32 } else { 0 },
         started: (fields[19].parse()?, 0),
         runnable: matches!(fields[0], "R" | "S" | "D" | "I"),
+        liveness: match fields[0] {
+            "Z" | "X" | "x" => Liveness::Exited,
+            "R" | "S" | "D" | "I" | "T" | "t" | "K" | "W" | "P" => Liveness::Alive,
+            _ => Liveness::Unknown,
+        },
     })
 }
 
@@ -55,11 +60,19 @@ mod tests {
     #[test]
     fn stat_rejects_truncation_and_stopped_states() {
         assert!(parse_stat(b"1 (bad) S 0").is_err());
-        for state in ["T", "t", "Z", "X"] {
+        for state in ["T", "t", "Z", "X", "x", "?"] {
             let stat = format!("1 (test) {state} 0 1 1 0 -1 {}9", "0 ".repeat(13));
             let parsed = parse_stat(stat.as_bytes()).unwrap();
             assert!(!parsed.runnable);
             assert_eq!(parsed.foreground, 0);
+            assert_eq!(
+                parsed.liveness,
+                match state {
+                    "T" | "t" => Liveness::Alive,
+                    "Z" | "X" | "x" => Liveness::Exited,
+                    _ => Liveness::Unknown,
+                }
+            );
         }
     }
 }

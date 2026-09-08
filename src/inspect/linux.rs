@@ -36,9 +36,12 @@ fn read_bounded(path: &str, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 pub(super) fn identity(pid: u32) -> Result<Option<Identity>> {
+    ensure!(pid > 0 && pid <= i32::MAX as u32, "invalid process PID");
     let bytes = match read_bounded(&format!("/proc/{pid}/stat"), 8192) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return super::confirm_missing(pid);
+        }
         Err(error) => return Err(error).context("cannot read process identity"),
     };
     let value = parse_stat(&bytes)?;

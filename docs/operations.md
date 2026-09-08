@@ -1,9 +1,28 @@
 # Operations
 
-The CLI in [README](../README.md) describes the implemented 0.1.0 candidate.
+The [README](../README.md) gives the short installation and configuration guide.
 Check `agent-float-term --help` and each command's `--help` on the installed
 version. See [compatibility](compatibility.md) for local validation and open gaps;
 do not infer release readiness or a completed GitHub CI run from this document.
+Invocation lifetime and main-terminal navigation have isolated PTY coverage on
+tmux 3.4, 3.5a, and 3.7c; see the current validation table for remaining limits.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `install [--tmux-config PATH] [--shell-config PATH --shell-kind bash\|zsh] [--yes]` | Preview installation; apply with `--yes`. Each startup file requires its own opt-in flag. |
+| `bind [--socket PATH] [--replace-key]` | Integrate with an existing server; foreign-key replacement requires opt-in. |
+| `start` | Open a dedicated normal shell, or initialize/bind the existing server when inside tmux. |
+| `doctor [--socket PATH]` | Read-only dependency, JSON config, and selected-server diagnosis. |
+| `sessions [--socket PATH]` | Inspect owned floats, including retained orphans. |
+| `cleanup [--socket PATH] [--session NAME] [--yes]` | Preview or explicitly remove eligible owned orphans. |
+| `update --from PATH --sha256 HASH` | Binary-only local SHA-256-verified update, not a template refresh. |
+| `rollback` | Restore the retained previous binary, if available. |
+| `uninstall [--yes]` | Preview or explicitly remove managed installation state. |
+
+See [JSON configuration](configuration.md) for `shortcut`, dimensions, and
+advanced executable paths. Use the same socket consistently across commands.
 
 ## Managed Installation
 
@@ -12,18 +31,26 @@ Run `install` directly from the extracted release binary or from
 The installer creates a digest-addressed payload and an owned symlink at
 `$HOME/.local/bin/agent-float-term`. Do not prepopulate that destination with a
 regular binary: unowned regular destinations are refused, not overwritten.
-See the [installation examples](../README.md#install).
+See the [installation examples](installation.md).
 
-Without `--tmux-config` or `--shell-config`, installation modifies no startup
+Without `--tmux-config` or `--shell-config`, a fresh installation modifies no startup
 files. Each flag independently selects a user file for integration.
 `--shell-config PATH --shell-kind bash|zsh` can opt into dedicated auto startup
 without `--tmux-config`. Reinstalling retains previously selected integrations;
 omitting their flags does not remove them or authorize edits to unselected user
 configs. A plain `install --yes` refreshes owned `integration.sh` and
-`integration.tmux` templates under the application's config directory, using the
+`integration.tmux` templates under the application's data directory, using the
 recorded shell kind when no shell file is selected. Edited or unowned templates
 are refused, not overwritten. Select whichever tmux config you actually use,
 such as `~/.tmux.conf` or `~/.config/tmux/tmux.conf`, rather than adding a second one.
+
+When migrating an existing layout, plain `install --yes` also repoints previously
+managed startup blocks to `${XDG_DATA_HOME:-$HOME/.local/share}/agent-float-term/`.
+Only the exact blocks recorded in the manifest are replaced; surrounding bytes
+and file permissions are preserved. Intact legacy scripts are removed from the
+config directory in the same recoverable transaction. Edited/missing scripts or
+blocks and occupied new destinations abort migration without overwriting them.
+The read-only preview lists these migration targets. `config.json` is untouched.
 
 ## Existing Or Dedicated tmux
 
@@ -110,7 +137,7 @@ different `/usr/bin/tmux`; this was validated with private tmux 3.7c while the
 system client remained 3.3a.
 
 The client must match the **running server's version**, not merely meet the
-3.3a minimum. In particular, a newer PATH client is not a substitute for the
+**3.4 minimum**. A newer PATH client is not a substitute for the
 matching private 3.5a client when the live server is 3.5a: mismatched terminal
 file-descriptor passing can fail even when metadata commands work. `bind` stores
 the approved client path in the private per-server binding record (`binary`, an
@@ -187,16 +214,46 @@ of keyboard ownership or a measurement of TUI startup latency.
 
 ## Lifetime And Ownership
 
-Each eligible parent pane owns one floating shell. Hiding a popup detaches its
-viewer rather than restarting the shell. Its PID, shell-local state, cwd, and
-running jobs persist while that tmux session/server remains alive. There is only
-one viewer; another client must not steal an attached viewer or create duplicate
-shells for the same parent pane.
+A float belongs to one
+eligible AI invocation in its original parent pane, not to that pane forever.
+Hiding detaches the viewer; the shell PID, local state, cwd, and running jobs
+persist only within that invocation. When the AI exits, its float resets
+promptly, including its shell and terminal jobs, without waiting for another F7 press.
+A later AI invocation in the same pane starts a fresh float. Do not use the float
+for work that must outlive the AI invocation.
+
+There is only one viewer; another client must not steal an attached viewer or
+create a duplicate float for the same invocation. A small detached watcher checks
+PID/start-time identity every 100 ms; stopped processes remain alive, and unknown
+metadata never authorizes deletion. Normal cleanup is prompt, not a hard real-time
+deadline. Daemonized jobs that escape the terminal are not process containment.
 
 The first float uses the parent pane's current directory. Later opens keep the
 float's own directory. Its environment comes from normal shell/tmux startup,
 not a snapshot of the parent program. If you activated a virtual environment or
 exported variables after starting tmux, you may need to do so in the float too.
+
+Main-terminal tmux keyboard shortcuts control the main terminal while
+the float is open, not an accidental inner tmux session. Navigating away
+temporarily hides the float. Returning to the original AI pane automatically
+restores it, provided the same invocation is still active and the float was not
+explicitly hidden. F7 hide disables automatic restoration until the user opens
+the float again. Native main-client key replay preserves the user's binding
+commands and modal tables. The popup yields during shortcut dispatch; prompts
+and choosers take focus until their native interaction ends. Return-to-origin
+restoration is checked approximately once per second, not on every redraw.
+
+Private input tables disable inner tmux keyboard commands. Main binding keys are
+refreshed on each opening; changes made while the popup is open take effect on
+the next opening. Mouse events stay with the float rather than being replayed
+against unrelated main-pane coordinates. Explicit `tmux` commands typed into the
+floating shell are still ordinary shell commands, not sandboxed.
+
+Restoration reserves an unused tmux `User` key with no terminal byte sequence.
+It enters native client input handling, so a prompt or unrelated popup consumes
+the probe without being replaced. A changed restore binding is never executed
+or removed as if it were still owned. Key tables and restore bindings are removed
+on verified cleanup/uninstall; global user shortcut definitions are not rewritten.
 
 F7 hides an owned float during normal popup input, including inside `nvim`.
 tmux command prompts and copy mode retain their native mode keys: exit the mode
@@ -204,9 +261,11 @@ first, then press F7 to hide. This is not a universal binding over all tmux key
 tables. In the outer pane, `nvim` and other non-AI programs receive F7 normally.
 Process-tree ambiguity also forwards it, even if that means a popup does not open.
 
-Losing the parent pane leaves an orphan; it is preserved deliberately. Neither
-detachment nor orphan preservation provides persistence across reboot, tmux
-server termination, or shell exit.
+Legacy or otherwise retained orphan sessions can still be inspected with
+`sessions` and removed only through explicit owned-orphan cleanup. They are not
+a promise that a completed AI invocation retains its jobs under the new
+contract. Neither detachment nor retained orphans provide persistence across
+reboot, tmux server termination, or shell exit.
 
 ## Terminal Theme And Opacity
 
@@ -311,6 +370,12 @@ agent-float-term --version
 agent-float-term doctor
 ```
 
+The data-directory layout uses installation manifest format 2; the current
+installer also reads format 1 to migrate existing installations. Binary rollback
+does not reverse a layout migration. An older binary can still run its runtime
+commands, but its installer/update/uninstall commands may reject format 2. Use
+the newer release binary directly for installation management in that case.
+
 Rollback is not a tmux-session snapshot, a job recovery mechanism, or a general
 configuration backup. Neither command guarantees recovery after a reboot.
 
@@ -326,6 +391,9 @@ Managed uninstall is not permission to terminate arbitrary tmux sessions or
 remove user-authored config. Before uninstalling, inspect owned sessions with
 `sessions` and use explicit orphan cleanup only when safe. Follow the uninstall
 preview/output rather than deleting broad directories.
+Both `config.json` and legacy `config.toml` are user files to preserve; see
+[migration](configuration.md#migration-and-safety). The final installer output
+must name both formats rather than implying only TOML is preserved.
 
 Applied uninstall calls the main command's `unbind_all` hook for recorded tmux
 servers. It restores prior key state only where the current binding still
@@ -351,7 +419,8 @@ publication checks. Do not restart servers with live jobs just to clear bindings
 | TUI startup pauses for a few seconds | Refresh old shell templates to prevent command/snapshot shells from attaching tmux. The demonstrated attach-blocking mechanism is fixed; the reported 2-5 second TUI latency itself is not measured, and other causes may remain. |
 | A new harness flag or alternate mode does not open a float | Check recognition limits. A supported executable path alone does not make every CLI grammar eligible. |
 | A private tmux works until the popup's login shell starts | Check `AFT_TMUX_BINARY` and the client/server versions; refresh integration with the correct absolute client instead of relying on login PATH. |
-| Custom AI installation is not detected | Configure an absolute `[[harness_paths]]` executable path; use the real supported harness name. |
+| Custom AI installation is not detected | Add an absolute executable path in the JSON `harness_paths` array; use the real supported harness name. See [configuration](configuration.md#advanced-paths). |
+| Config fails after upgrading from TOML | Create `config.json`, convert the structure to JSON, and rename `key` to `shortcut`. The old file is unchanged and never loaded. `{}` explicitly selects defaults. |
 | F7 hides an editor inside the float | Expected during normal popup input. Use another editor key there. |
 | F7 does not hide during a tmux command prompt or copy mode | Native mode keys take priority. Exit the mode, then press F7. |
 | Existing server integration rejects detach settings | Review global `exit-unattached` and `destroy-unattached`; either being `on` is unsafe for this integration. Use a dedicated server if you cannot change them. |
@@ -360,7 +429,8 @@ publication checks. Do not restart servers with live jobs just to clear bindings
 | The float has a different environment | Expected: it is a new shell, not an environment clone. Check shell startup and tmux environment. |
 | The float has an older cwd | Expected after first creation: its own cwd persists. Change directory inside it. |
 | A second client cannot open the same float | Check for an existing viewer; a float is single-viewer. |
-| Sessions remain after their parent panes close | Expected orphan preservation; inspect before explicit cleanup. |
+| Retained orphan sessions remain | Inspect before explicit cleanup. Historical orphan behavior does not verify the new invocation-exit reset contract. |
+| Float resets after the AI exits | Shell and terminal jobs belong to that invocation. This is not persistent background-job storage. |
 | Shell/jobs disappear after reboot or server exit | Those lifetimes are not supported persistence boundaries. |
 | Download fails with 404 | The selected version may not be published yet; use source builds or inspect the releases page. |
 
@@ -398,3 +468,16 @@ this tool rewrite them or restarting a server with live jobs.
 When reporting a bug, include OS/architecture, `tmux -V`, the binary version,
 terminal, harness version, whether the server is existing/dedicated, and minimal
 redacted diagnostic output. Never upload raw prompt history or tokens.
+
+## Privacy And Development
+
+This tool includes no telemetry or prompt logging. The float is an ordinary
+shell with your permissions; **tmux is not a sandbox**. AI tools, shell history,
+tmux scrollback, plugins, and terminal recording may independently retain
+sensitive content. Do not include prompts, tokens, or private output in reports.
+
+See [Contributing](../CONTRIBUTING.md), the [release checklist](release-checklist.md),
+and [Changelog](../CHANGELOG.md). CI configuration is not proof of a passing
+GitHub run. Historical local tests and benchmarks are recorded separately in
+the [compatibility matrix](compatibility.md); no end-to-end latency guarantee is
+asserted. MIT licensed; copyright (c) 2026 vuongvm812. See [LICENSE](../LICENSE).

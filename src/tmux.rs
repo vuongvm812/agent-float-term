@@ -1,6 +1,7 @@
 //! tmux owns the terminals; this module owns only explicitly marked bindings and sessions.
 
 use crate::config::{self, checked_path, private_dir, Config, Paths};
+use crate::inspect::{Invocation, Liveness};
 use crate::install::shell_quote;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod lifecycle;
+mod routing;
+
+pub use lifecycle::watch;
 
 const GENERATION: &str = "@aft_generation";
 const OWNER: &str = "@aft_owner";
@@ -303,7 +309,7 @@ impl Tmux {
         let version = self.output(&["display-message", "-p", "#{version}"])?;
         ensure!(
             supported_version(&version),
-            "running tmux {version} is unsupported; need 3.3a or newer"
+            "running tmux {version} is unsupported; need 3.4 or newer"
         );
         let client = self.client_version()?;
         ensure!(client == version,
@@ -395,15 +401,16 @@ impl Tmux {
         let all = self.output(&[
             "list-clients",
             "-F",
-            "#{client_pid}|#{client_name}|#{pane_id}",
+            "#{client_pid}|#{client_name}|#{pane_id}|#{session_id}",
         ])?;
         for line in all.lines() {
             let fields: Vec<_> = line.split('|').collect();
-            if fields.len() == 3 && fields[0].parse::<u32>() == Ok(pid) {
+            if fields.len() == 4 && fields[0].parse::<u32>() == Ok(pid) {
                 return Ok(Client {
                     pid,
                     name: fields[1].into(),
                     pane: fields[2].into(),
+                    session: fields[3].into(),
                 });
             }
         }
@@ -415,6 +422,9 @@ impl Tmux {
     }
 
     fn forward(&self, pane: &Pane, client: &Client, key: &str) -> Result<()> {
+        if env::var_os("AFT_RESTORE_INSTANCE").is_some() {
+            return Ok(());
+        }
         if self.client_by_name_is_on(client, &pane.id)? {
             self.output(&["send-keys", "-t", &pane.id, key])?;
         }
@@ -422,7 +432,12 @@ impl Tmux {
     }
 
     fn client_by_name_is_on(&self, client: &Client, pane: &str) -> Result<bool> {
-        Ok(self.client(client.pid)?.pane == pane)
+        let current = self.client(client.pid)?;
+        Ok(
+            current.name == client.name
+                && current.session == client.session
+                && current.pane == pane,
+        )
     }
 
     fn popup_policy(&self, generation: &str) -> Result<()> {
@@ -462,12 +477,15 @@ impl Tmux {
             ";",
             "list-clients",
             "-F",
-            "#{client_pid}|#{pane_id}",
+            "#{client_pid}|#{client_name}|#{session_id}|#{pane_id}|#{pane_in_mode}",
         ])?;
         let mut lines = metadata.lines();
         ensure!(lines.next() == Some(&pane.generation) && lines.next() == Some("off") && lines.next() == Some("off"),
             "global generation or detach policies changed during shell startup; popup was not opened");
-        let expected = format!("{}|{}", client.pid, pane.id);
+        let expected = format!(
+            "{}|{}|{}|{}|0",
+            client.pid, client.name, client.session, pane.id
+        );
         Ok(lines.any(|line| line == expected))
     }
 }
@@ -488,6 +506,7 @@ struct Client {
     pid: u32,
     name: String,
     pane: String,
+    session: String,
 }
 
 // list-keys aligns columns according to the other keys in its table. Normalize
@@ -523,11 +542,7 @@ fn supported_version(value: &str) -> bool {
     let Ok(minor) = digits.parse::<u32>() else {
         return false;
     };
-    major > 3
-        || (major == 3
-            && (minor > 3
-                || (minor == 3
-                    && rest[digits.len()..].starts_with(|c: char| c.is_ascii_lowercase()))))
+    major > 3 || (major == 3 && minor >= 4)
 }
 
 fn runtime_dir() -> Result<PathBuf> {
@@ -544,6 +559,10 @@ fn record_path(socket: &Path) -> Result<PathBuf> {
 }
 
 fn lock(path: &Path) -> Result<File> {
+    lock_for(path, Duration::from_secs(2))?.context("another agent-float-term operation is busy")
+}
+
+fn lock_for(path: &Path, timeout: Duration) -> Result<Option<File>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -561,17 +580,16 @@ fn lock(path: &Path) -> Result<File> {
     loop {
         // SAFETY: file owns this descriptor for the entire lifetime of the lock.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
+            return Ok(Some(file));
         }
         let error = std::io::Error::last_os_error();
         ensure!(
             error.kind() == std::io::ErrorKind::WouldBlock,
             "lock failed: {error}"
         );
-        ensure!(
-            start.elapsed() < Duration::from_secs(2),
-            "another agent-float-term operation is busy"
-        );
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -619,7 +637,7 @@ fn binary_stamp(path: &Path) -> Result<BinaryStamp> {
 fn validate_popup_client(tmux: &Tmux, pane: &Pane) -> Result<()> {
     ensure!(
         supported_version(&pane.server_version),
-        "running tmux is older than 3.3a"
+        "running tmux is older than 3.4"
     );
     ensure!(
         valid_token(&pane.generation),
@@ -806,7 +824,7 @@ pub fn bind(socket: Option<PathBuf>, replace_key: bool) -> Result<()> {
         "-F",
         &float,
         "detach-client",
-        &format!("run-shell {}", tmux_quote(&command)),
+        &format!("run-shell -b {}", tmux_quote(&command)),
     ])?;
     let serialized = tmux.output(&["list-keys", "-T", &table]);
     tmux.output(&["unbind-key", "-a", "-T", &table])?;
@@ -903,17 +921,20 @@ pub fn unbind_all() -> Result<()> {
             tmux
         });
         match server {
-            Ok(tmux) => match restore(&tmux, &record) {
-                Ok(true) => println!("Restored {} on {}", record.key, record.socket.display()),
-                Ok(false) => println!(
-                    "Preserved changed or restarted server binding on {}",
-                    record.socket.display()
-                ),
-                Err(error) => {
-                    eprintln!("Preserved unavailable binding record: {error}");
-                    continue;
+            Ok(tmux) => {
+                routing::cleanup_server(&tmux, &record.generation)?;
+                match restore(&tmux, &record) {
+                    Ok(true) => println!("Restored {} on {}", record.key, record.socket.display()),
+                    Ok(false) => println!(
+                        "Preserved changed or restarted server binding on {}",
+                        record.socket.display()
+                    ),
+                    Err(error) => {
+                        eprintln!("Preserved unavailable binding record: {error}");
+                        continue;
+                    }
                 }
-            },
+            }
             Err(_) => {
                 eprintln!(
                     "Server unavailable: {}; missing-executable forwarding remains in place",
@@ -1003,7 +1024,7 @@ pub fn start() -> Result<()> {
     let version = checked_output(capture(Command::new(&binary).arg("-V"), None)?)?;
     ensure!(
         supported_version(version.trim_start_matches("tmux ")),
-        "need tmux 3.3a or newer"
+        "need tmux 3.4 or newer"
     );
     let session = format!("aft-work-{}", &token()?[..12]);
     let shell = config
@@ -1093,7 +1114,8 @@ fn alive(pid: &str) -> bool {
         return false;
     }
     // SAFETY: signal 0 only queries process existence/permission; it sends no signal.
-    unsafe { libc::kill(pid, 0) == 0 }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub fn dispatch(socket: PathBuf, pane: String, client_pid: u32, key: String) -> Result<()> {
@@ -1108,17 +1130,28 @@ pub fn dispatch(socket: PathBuf, pane: String, client_pid: u32, key: String) -> 
     if client.pane != pane.id {
         return Ok(());
     }
-    let config = match config::load() {
+    let mut config = match config::load() {
         Ok(config) => config,
         Err(_) => return tmux.forward(&pane, &client, &key),
     };
-    if pane.in_mode
-        || !crate::inspect::eligible(pane.pid, &pane.tty, &config.harness_paths)
-            .is_ok_and(|decision| decision.eligible)
+    // Use tmux's installed spelling (for example Tab for C-i). Shortcut edits
+    // take effect on bind; dimensions still reload on every opening.
+    if let Some(binding) = read_record(&record_path(&tmux.socket)?)?
+        .filter(|binding| binding.socket == tmux.socket && binding.generation == pane.generation)
     {
+        config.key = binding.key;
+    }
+    if pane.in_mode {
         return tmux.forward(&pane, &client, &key);
     }
-    match popup(&tmux, &pane, &client, &config) {
+    let invocation = crate::inspect::eligible(pane.pid, &pane.tty, &config.harness_paths)
+        .ok()
+        .filter(|decision| decision.eligible)
+        .and_then(|decision| decision.invocation);
+    let Some(invocation) = invocation else {
+        return tmux.forward(&pane, &client, &key);
+    };
+    match popup(&tmux, &pane, &client, &config, invocation) {
         Ok(()) => Ok(()),
         Err(error) => {
             let detail: String = format!("pane {}: {error:#}", pane.id)
@@ -1138,29 +1171,61 @@ pub fn dispatch(socket: PathBuf, pane: String, client_pid: u32, key: String) -> 
     }
 }
 
-fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<()> {
+fn popup(
+    tmux: &Tmux,
+    pane: &Pane,
+    client: &Client,
+    config: &Config,
+    invocation: Invocation,
+) -> Result<()> {
     validate_popup_client(tmux, pane)?;
     let generation = &pane.generation;
-    let session = format!("aft-{}-{}", &generation[..12], &pane.id[1..]);
-    let lock_path = runtime_dir()?.join(format!("{session}.lock"));
+    let lock_path = lifecycle::parent_lock(generation, &pane.id)?;
     let guard = lock(&lock_path)?;
     let listing = tmux.output(&[
         "list-sessions",
         "-F",
-        "#{session_id}|#{@aft_owner}|#{@aft_float_generation}|#{session_attached}|#{@aft_worker}|#{window_id}|#{pane_id}|#{window_linked}",
+        "#{session_id}|#{@aft_owner}|#{@aft_float_generation}|#{session_attached}|#{@aft_worker}|#{window_id}|#{pane_id}|#{window_linked}|#{@aft_invocation}|#{@aft_instance}",
     ])?;
     let owned: Vec<_> = listing
         .lines()
         .filter_map(|line| {
             let fields: Vec<_> = line.split('|').collect();
-            (fields.len() == 8 && fields[1] == pane.id && fields[2] == generation).then_some(fields)
+            (fields.len() == 10 && fields[1] == pane.id && fields[2] == generation)
+                .then_some(fields)
+        })
+        .collect();
+    if let Some(instance) = env::var_os("AFT_RESTORE_INSTANCE") {
+        let Some(instance) = instance.to_str().filter(|value| valid_token(value)) else {
+            return Ok(());
+        };
+        let Some(fields) = owned.iter().find(|fields| fields[9] == instance) else {
+            return Ok(());
+        };
+        if !lifecycle::restore_allowed(tmux, fields[0], instance, invocation, client)? {
+            return Ok(());
+        }
+    }
+    // Old identity-less sessions are retained, never adopted or automatically killed.
+    for fields in &owned {
+        if let Ok(old) = serde_json::from_str::<Invocation>(fields[8]) {
+            if old != invocation && old.liveness() == Liveness::Exited && valid_token(fields[9]) {
+                lifecycle::kill_owned(tmux, fields[0], generation, &pane.id, fields[9], old)?;
+            }
+        }
+    }
+    let matching: Vec<_> = owned
+        .iter()
+        .filter(|fields| {
+            serde_json::from_str::<Invocation>(fields[8]).ok() == Some(invocation)
+                && valid_token(fields[9])
         })
         .collect();
     ensure!(
-        owned.len() <= 1,
+        matching.len() <= 1,
         "multiple sessions claim this pane; inspect sessions before continuing"
     );
-    let (target, window, float_pane) = if let Some(fields) = owned.first() {
+    let (target, window, float_pane, instance) = if let Some(fields) = matching.first() {
         if fields[3] != "0" || alive(fields[4]) {
             tmux.message(
                 client,
@@ -1169,13 +1234,14 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
             return Ok(());
         }
         ensure!(
-            fields[7] == "0",
+            fields[7] == "0" && lifecycle::exclusive_windows(tmux, fields[0])?,
             "owned floating window is linked to another session; left untouched"
         );
         (
             fields[0].to_owned(),
             fields[5].to_owned(),
             fields[6].to_owned(),
+            fields[9].to_owned(),
         )
     } else {
         let cwd = text(&pane.cwd)?;
@@ -1189,6 +1255,8 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
         };
         checked_path(&shell)?;
         tmux.popup_policy(generation)?;
+        let instance = token()?;
+        let session = format!("aft-{}-{}-{instance}", &generation[..12], &pane.id[1..]);
         let target = tmux.output(&[
             "new-session",
             "-d",
@@ -1222,6 +1290,18 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
             "set-option",
             "-t",
             &target,
+            "@aft_instance",
+            &instance,
+            ";",
+            "set-option",
+            "-t",
+            &target,
+            "@aft_invocation",
+            &serde_json::to_string(&invocation)?,
+            ";",
+            "set-option",
+            "-t",
+            &target,
             "destroy-unattached",
             "off",
             ";",
@@ -1242,14 +1322,20 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
             fields.len() == 3 && fields[2] == "0",
             "new floating window is linked elsewhere or unavailable"
         );
-        (target, fields[0].to_owned(), fields[1].to_owned())
+        (target, fields[0].to_owned(), fields[1].to_owned(), instance)
     };
+    lifecycle::start_watcher(tmux, &target, &instance)?;
     if !tmux.popup_client_unchanged(client, pane)? {
         return Ok(());
     }
     // Revalidate after session creation, which can run a shell's startup files.
     if !crate::inspect::eligible(pane.pid, &pane.tty, &config.harness_paths)
-        .is_ok_and(|d| d.eligible)
+        .is_ok_and(|d| d.eligible && d.invocation == Some(invocation))
+    {
+        return Ok(());
+    }
+    if env::var_os("AFT_RESTORE_INSTANCE").is_some()
+        && !lifecycle::restore_allowed(tmux, &target, &instance, invocation, client)?
     {
         return Ok(());
     }
@@ -1257,8 +1343,9 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
     // Keep the safety checks at the mutation boundary, not just in an earlier
     // snapshot. All style changes are local to this exclusively owned window/pane.
     let condition = [
-        format!("#{{==:#{{@aft_owner}},{}}}", pane.id),
-        format!("#{{==:#{{@aft_float_generation}},{generation}}}"),
+        lifecycle::ownership_condition(generation, &pane.id, &instance, invocation)?,
+        "#{==:#{session_grouped},0}".into(),
+        "#{==:#{m:*1*,#{W:#{window_linked}}},0}".into(),
         "#{==:#{session_attached},0}".into(),
         "#{==:#{window_linked},0}".into(),
         "#{==:#{exit-unattached},0}".into(),
@@ -1276,11 +1363,20 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
          set-option -p -t {float_pane} window-style {style} ; \
          set-option -p -t {float_pane} window-active-style {style} ; \
          set-option -t {target} @aft_worker {worker} ; \
+         set-option -t {target} @aft_viewer '' ; \
+         set-option -t {target} @aft_visible 1 ; \
+         set-option -t {target} @aft_routing 0 ; \
+         set-option -t {target} @aft_origin_client {origin_pid} ; \
+         set-option -t {target} @aft_origin_name {origin_name} ; \
+         set-option -t {target} @aft_origin_session {origin_session} ; \
          set-option -g @aft_last_error '' ; display-message -p AFT_READY",
         target = tmux_quote(&target),
         window = tmux_quote(&window),
         float_pane = tmux_quote(&float_pane),
         style = tmux_quote(TERMINAL_STYLE),
+        origin_pid = client.pid,
+        origin_name = tmux_quote(&client.name),
+        origin_session = tmux_quote(&client.session),
     );
     let reply = tmux.source_result(&format!(
         "if-shell -F -t {} {} {} {}\n",
@@ -1293,52 +1389,58 @@ fn popup(tmux: &Tmux, pane: &Pane, client: &Client, config: &Config) -> Result<(
         reply == "AFT_READY",
         "floating session changed, is linked, or is already attached; left untouched"
     );
-    let command = format!(
-        "{} -T RGB -S {} attach-session -E -t {}",
-        shell_quote(text(&tmux.binary)?),
-        shell_quote(text(&tmux.socket)?),
-        shell_quote(&target)
-    );
-    drop(guard);
-    // This client waits only while the popup is visible. Detaching the inner client
-    // exits its command, which closes -E without terminating the retained shell.
-    let result = tmux
-        .command()
-        .args([
-            "display-popup",
-            "-E",
-            "-s",
-            "fg=terminal,bg=terminal",
-            "-S",
-            "fg=terminal,bg=terminal",
-            "-c",
-            &client.name,
-            "-t",
-            &pane.id,
-            "-w",
-            &format!("{}%", config.width),
-            "-h",
-            &format!("{}%", config.height),
-            "-x",
-            "C",
-            "-y",
-            "C",
-            &command,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .status();
+    let result = (|| -> Result<std::process::ExitStatus> {
+        let command = lifecycle::viewer_command(tmux, &target, &instance, &worker)?;
+        routing::prepare(tmux, pane, client, &target, config)?;
+        drop(guard);
+        // This client waits only while the popup is visible. Detaching the inner client
+        // exits its command, which closes -E without terminating the retained shell.
+        Ok(tmux
+            .command()
+            .args([
+                "display-popup",
+                "-E",
+                "-s",
+                "fg=terminal,bg=terminal",
+                "-S",
+                "fg=terminal,bg=terminal",
+                "-c",
+                &client.name,
+                "-t",
+                &pane.id,
+                "-w",
+                &format!("{}%", config.width),
+                "-h",
+                &format!("{}%", config.height),
+                "-x",
+                "C",
+                "-y",
+                "C",
+                &command,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .status()?)
+    })();
     // A single in-server conditional clears only this worker's claim. There is no
     // read/clear round trip and a late cleanup cannot erase a newer viewer claim.
-    let _ = tmux.output(&[
+    let _guard = lock(&lock_path).ok();
+    let closed_by_route = tmux.output(&[
         "if-shell",
         "-F",
         "-t",
         &target,
-        &format!("#{{==:#{{@aft_worker}},{worker}}}"),
-        &format!("set-option -t {} @aft_worker ''", tmux_quote(&target)),
-    ]);
-    ensure!(result?.success(), "tmux popup command failed");
+        &format!("#{{&&:#{{==:#{{@aft_instance}},{instance}}},#{{==:#{{@aft_worker}},{worker}}}}}"),
+        &format!(
+            "display-message -p -t {target} '#{{@aft_routing}}' ; set-option -t {target} @aft_worker '' ; set-option -t {target} @aft_viewer ''",
+            target = tmux_quote(&target)
+        ),
+    ]).is_ok_and(|reason| reason == "1");
+    routing::finished(tmux, &target, &worker);
+    ensure!(
+        result?.success() || closed_by_route || invocation.liveness() == Liveness::Exited,
+        "tmux popup command failed"
+    );
     Ok(())
 }
 
@@ -1396,6 +1498,7 @@ pub fn sessions(socket: Option<PathBuf>) -> Result<()> {
 
 pub fn cleanup(socket: Option<PathBuf>, session: Option<String>, yes: bool) -> Result<()> {
     let tmux = Tmux::resolve(socket)?;
+    let generation = tmux.generation()?;
     let floats = owned_sessions(&tmux)?;
     if let Some(name) = &session {
         ensure!(
@@ -1415,20 +1518,35 @@ pub fn cleanup(socket: Option<PathBuf>, session: Option<String>, yes: bool) -> R
         if !yes {
             continue;
         }
-        let lock_path = runtime_dir()?.join(format!(
-            "aft-{}-{}.lock",
-            &tmux.generation()?[..12],
-            &float.owner[1..]
-        ));
+        let lock_path = lifecycle::parent_lock(&generation, &float.owner)?;
         let _guard = lock(&lock_path)?;
         let still_owned = owned_sessions(&tmux)?
             .into_iter()
             .any(|f| f.id == float.id && f.orphan && f.attached == 0);
         ensure!(
-            still_owned,
-            "session changed or is attached; left untouched"
+            still_owned
+                && tmux.generation()? == generation
+                && lifecycle::exclusive_windows(&tmux, &float.id)?,
+            "session changed, is attached, grouped, or linked; left untouched"
         );
-        tmux.output(&["kill-session", "-t", &float.id])?;
+        let condition = [
+            format!("#{{==:#{{@aft_float_generation}},{generation}}}"),
+            format!("#{{==:#{{@aft_owner}},{}}}", float.owner),
+            "#{==:#{session_attached},0}".into(),
+            "#{==:#{session_grouped},0}".into(),
+            "#{==:#{m:*1*,#{W:#{window_linked}}},0}".into(),
+        ]
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .unwrap();
+        tmux.output(&[
+            "if-shell",
+            "-F",
+            "-t",
+            &float.id,
+            &condition,
+            &format!("kill-session -t {}", tmux_quote(&float.id)),
+        ])?;
     }
     if !yes {
         println!("Preview only; repeat with --yes to terminate owned orphan shells.");
@@ -1511,10 +1629,10 @@ mod tests {
 
     #[test]
     fn version_floor_and_identifiers() {
-        for value in ["3.3a", "3.4", "3.7c", "4.0"] {
+        for value in ["3.4", "3.7c", "4.0"] {
             assert!(supported_version(value));
         }
-        for value in ["3.2a", "3.3", "2.9", "unknown", "next-3.4"] {
+        for value in ["3.2a", "3.3", "3.3a", "3.3z", "2.9", "unknown", "next-3.4"] {
             assert!(!supported_version(value));
         }
         assert!(valid_pane("%123"));
