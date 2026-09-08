@@ -18,6 +18,7 @@ available. Choose one method; switching an existing installation requires the
 After the stable release and tap formula are published:
 
 ```sh
+brew tap vuongvm812/tap
 brew install vuongvm812/tap/agent-float-term
 aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
 "$aft" install --external-binary "$aft"
