@@ -1,8 +1,14 @@
 name: Release
+run-name: Release ${{ inputs.tag }} ${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
     inputs:
+      request_id:
+        description: Optional unique orchestration ID (leave empty for manual runs)
+        required: false
+        default: ''
+        type: string
       tag:
         description: Existing maintainer-created tag (v0.1.0 or v0.1.0-rc.1)
         required: true
@@ -109,10 +115,10 @@ jobs:
       - name: Download this run's archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: release-*
+          pattern: release-*-* # Native archives only, not the verification artifact.
           merge-multiple: true
           path: dist
-      - name: Verify assets and create draft
+      - name: Verify assets and record build evidence
         working-directory: dist
         shell: bash
         env:
@@ -145,7 +151,52 @@ jobs:
           fi
           # Check both the original tag object and its peeled commit immediately before upload.
           python3 -B ../scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
-          options=(--draft --verify-tag --target "$COMMIT" --title "$TAG" --generate-notes)
+          python3 - "${assets[@]}" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          record = {key: os.environ[env] for key, env in (
+              ("tag", "TAG"), ("commit", "COMMIT"), ("tag_object", "TAG_OBJECT"),
+              ("run_id", "GITHUB_RUN_ID"), ("run_attempt", "GITHUB_RUN_ATTEMPT"))}
+          record["sha256"] = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()
+                              for name in sys.argv[1:]}
+          with pathlib.Path("release-verification.json").open("x") as output:
+              json.dump(record, output, sort_keys=True)
+          PY
+      - name: Preserve immutable build evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-verification
+          path: dist/release-verification.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+      - name: Create draft with the five stable release assets
+        working-directory: dist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_OBJECT: ${{ needs.resolve.outputs.tag_object }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          assets=(
+            "agent-float-term-$TAG-aarch64-apple-darwin.tar.gz"
+            "agent-float-term-$TAG-x86_64-apple-darwin.tar.gz"
+            "agent-float-term-$TAG-x86_64-unknown-linux-gnu.tar.gz"
+            SHA256SUMS
+          )
+          if [[ "$PRERELEASE" == false ]]; then
+            assets+=(agent-float-term.rb)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            printf '%s\n' 'Release already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          python3 -B ../scripts/release_source.py check "$TAG" "$COMMIT" "$TAG_OBJECT" "$GH_REPO"
+          # Persist exact-source CI evidence so orchestration can safely resume later.
+          evidence="Release source: $COMMIT"$'\n'"Release tag object: $TAG_OBJECT"$'\n'"Release verification: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+          options=(--draft --verify-tag --target "$COMMIT" --title "$TAG" --generate-notes --notes "$evidence")
           if [[ "$PRERELEASE" == true ]]; then
             options+=(--prerelease)
           fi

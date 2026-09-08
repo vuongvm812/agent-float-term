@@ -1,24 +1,25 @@
 # Compatibility And Validation
 
-**Current status: native-package release setup locally tested; publication pending.**
+**Current status: coordinated release and Homebrew first-use changes locally tested.**
 The runtime minimum is **3.4**. Each float belongs to one AI invocation and is
 reset when it exits. Tmux keyboard shortcuts target the main terminal.
 Returning to the original AI pane restores a
 temporarily hidden float; explicit F7 hide disables restoration until reopened.
 Current evidence is separate from the historical results below.
 
-No GitHub CI run or published release is recorded here. Local historical source
-and archive validation does not establish current runtime acceptance, a completed
-remote matrix, or public-download acceptance.
+These latest changes have not been published or tested in remote CI. The older
+0.2.2 crate is already public. Historical source/archive validation does not
+establish acceptance of new runtime changes or a completed remote matrix.
 
 ## Current Change Validation
 
 | Change | Evidence | Still Needed |
 | --- | --- | --- |
-| Configuration, installer, and Rust APIs | 85 macOS ARM64 tests and Clippy passed; 83 tests passed on non-root Debian 12 ARM64, Rust 1.84.1 | Linux x86_64 release and remote CI acceptance |
+| Configuration, installer, and Rust APIs | 89 macOS ARM64 tests and Clippy passed; current Linux ARM64 test-target cross-check passed; 83 non-root Debian 12 ARM64 tests passed before first-use changes | Current Linux runtime and remote CI acceptance |
 | Generated integration layout | Fresh install, Bash/Zsh migration, no-write preview, idempotency, byte/mode preservation, collision/edited-file refusal, and migrated uninstall passed; all four release smoke suites passed | Broader Linux runtime migration coverage |
-| JSON-based smoke fixtures | All five current release smoke suites passed on macOS tmux 3.7c, also against a freshly extracted native ARM64 archive; earlier core PTY/theme suites also passed on 3.4 and 3.5a | Intel/Linux x86_64 archive acceptance and updated latency benchmark |
-| Package-owned executable upgrades | External-upgrade PTY passed on macOS 3.7c (release/debug) and non-root Debian 12 ARM64 3.4 (debug); realistic 0775 package groups, removed old keg, original watcher and shell state, stable root/restore bindings | Real Homebrew upgrade acceptance and remaining native targets |
+| JSON-based smoke fixtures | All five current release smoke suites passed on macOS tmux 3.7c; extracted ARM64 archive acceptance and 3.4/3.5a coverage predate first-use changes | Updated archive acceptance and latency benchmark |
+| Package-owned executable upgrades | Current first-bind/start and upgrade PTY passed on macOS 3.7c; prior non-root Debian 12 ARM64 3.4 debug upgrade test passed; realistic 0775 package groups, removed old keg, original watcher and shell state, stable root/restore bindings | Linux first-use runtime, real Homebrew upgrade acceptance, and remaining native targets |
+| Coordinated publication | 60 offline release-tool tests, local Make dry run, and workflow lint passed; altered assets are refused even when their current checksums/formula agree, unless they match immutable build evidence | Real Actions evidence upload/download and confirmed publication; no live mutation tests were run |
 | Cargo distribution | Upload file list inspected; publish dry-run built the unpacked crate and aborted upload as expected; actual Cargo install/uninstall from unpacked crate passed with isolated root and integration-only setup | Clean tagged-source remote gate and installation from published crates.io version |
 | Homebrew formula and release helpers | 14 fixture tests, actual Homebrew DSL loading, isolated formula integration test, Ruby syntax, actionlint, and ShellCheck passed | Full audit blocked locally by missing `rubocop-ast`; public formula URLs and real Brew install/test/upgrade/uninstall remain pending |
 | tmux 3.4 minimum | Enforced at runtime; core PTY suite passed on macOS 3.4, 3.5a, and 3.7c; CI minimum lane updated and archive hash verified | GitHub CI execution |

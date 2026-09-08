@@ -1,5 +1,25 @@
 # Release Checklist
 
+## Release Coordination
+
+The latest change adds [confirmed `make release`](publishing.md#make-release)
+and Homebrew first-use registration. These results supersede the older counts
+below for this change only; no publication or live installation was performed.
+
+- [x] 60 offline Python release tests: confirmation/dry-run, retries, immutable
+  build-proof hashes, source identity, tap ownership, and downgrade refusal.
+- [x] 89 macOS Rust tests, formatting, Clippy, and Linux ARM64 test-target
+  cross-check. All five release smoke suites pass on macOS tmux 3.7c, including
+  first Homebrew bind/start, read-only diagnostics, and old-keg removal.
+- [x] Workflow lint passes. Existing v0.2.2 tap formula/assets were not rewritten.
+- [ ] Prepare a new matching version, lockfile, source commit, and tag. Published
+  0.2.2 crate provenance differed from the v0.2.2 tag during tooling validation;
+  the coordinator refuses that mismatch rather than replacing a public version.
+- [ ] Run remote CI/build-proof upload and actual publication after review.
+  Current publication mutations are covered by offline mocks, not a live release.
+- [ ] Complete Linux first-use runtime and updated Homebrew/package acceptance.
+  Cross-compilation and the earlier Linux external-registration tests are separate.
+
 **Current status: refactor locally tested; publication checks remain pending.**
 The minimum is now tmux **3.4**. Current macOS core PTY tests pass on 3.4, 3.5a,
 and 3.7c. Current results are recorded separately from the historical work below.

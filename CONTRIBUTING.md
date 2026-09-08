@@ -27,7 +27,7 @@ expect tests/autostart_smoke.exp target/debug/agent-float-term
 expect tests/theme_smoke.exp target/debug/agent-float-term
 cargo +1.84.1 build --locked --release
 expect tests/external_smoke.exp target/release/agent-float-term
-python3 -B scripts/test_release_helpers.py
+python3 -B -m unittest discover -s scripts -p 'test_release*.py'
 ruby scripts/test-homebrew-formula.rb target/release/agent-float-term
 # In a clean checkout of the source intended for packaging:
 bash scripts/verify-cargo-package.sh
@@ -53,6 +53,11 @@ explicit fixture configuration (`tmux -f /dev/null` for isolated test servers).
 They must not attach to or kill an unrelated server, edit real startup files,
 or clean up user sessions. Cleanup traps should target only resources the test
 created. Keep fixture output synthetic; never record real prompts or secrets.
+
+Release orchestration tests mock Git/GitHub/Cargo/network mutations. Do not run
+confirmed `make release` to test the tooling: it publishes releases and commits/
+pushes the tap formula. Use the offline tests and `make release DRY_RUN=1`; the
+latter is a local plan only, not a remote preflight. See [publishing](docs/publishing.md#make-release).
 
 All five required Expect entry points accept the binary as their first argument.
 Each test owns creation and teardown of its isolated environment and must fail

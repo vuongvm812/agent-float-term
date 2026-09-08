@@ -104,9 +104,7 @@ set failed [catch {
         file attributes $directory -group $package_group
         file attributes $directory -permissions $package_mode
     }
-    exec $binary install --external-binary $binary --yes
-    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/current]} "external install created current"
-    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/releases]} "external install created releases"
+    check {![file exists $env(XDG_STATE_HOME)/agent-float-term/install.json]} "unexpected prior registration"
     set socket $env(TMUX_TMPDIR)/server
     tm -f /dev/null new-session -d -s outer -c $env(HOME) $shell --noprofile --norc -i
     tm set-option -g default-shell $shell
@@ -115,6 +113,10 @@ set failed [catch {
     tm bind-key -n F7 display-message AFT_ORIGINAL_BINDING
     set original [binding root F7]
     exec $binary bind --socket $socket --replace-key
+    check {[file exists $env(XDG_STATE_HOME)/agent-float-term/install.json]} "first bind did not register Homebrew"
+    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/current]} "first bind created current"
+    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/releases]} "first bind created releases"
+    check {![file exists $env(HOME)/.local/bin/agent-float-term]} "first bind copied a managed executable"
     set bound [binding root F7]
     stable_command $bound "root binding"
     set outer [tm display-message -p -t outer: {#{pane_id}}]
@@ -185,6 +187,12 @@ set failed [catch {
     # the original state root. Only the installer, not runtime fallback, pins those roots.
     exec $source_binary install --yes 2>@1
     set managed $env(HOME)/.local/bin/agent-float-term
+    spawn -noecho $binary start
+    set rejected_start $spawn_id
+    expect -i $rejected_start -re {explicitly uninstall} {} timeout { error "start did not reject managed registration" } eof { error "start exited without migration guidance" }
+    expect -i $rejected_start eof {} timeout { error "conflicting start did not exit" }
+    check {[lindex [wait -i $rejected_start] 3] != 0} "conflicting start succeeded"
+    check {[file exists $managed]} "conflicting start changed managed payload"
     set config_home $env(XDG_CONFIG_HOME)
     set data_home $env(XDG_DATA_HOME)
     set env(XDG_CONFIG_HOME) $root/alternate-config
@@ -195,7 +203,37 @@ set failed [catch {
     set env(XDG_DATA_HOME) $data_home
     exec $managed uninstall --yes 2>@1
     check {[binding root F7] eq $original} "managed uninstall did not restore original binding"
-    puts "PASS: external upgrade ([exec $tmux -V], package directories $package_mode :$package_group); stable root/restore commands, original watcher, shell state, cleanup, managed alternate XDG roots"
+    tm kill-server
+    catch {close -i $client}
+    catch {wait -i $client}
+    set client ""
+
+    # A completely fresh HOME/XDG layout: no installer has run before this start.
+    foreach {name directory} {HOME start-home XDG_CONFIG_HOME start-config XDG_DATA_HOME start-data XDG_STATE_HOME start-state XDG_CACHE_HOME start-cache XDG_RUNTIME_DIR start-runtime} {
+        set env($name) [file join $root $directory]
+        file mkdir $env($name)
+        file attributes $env($name) -permissions 0700
+    }
+    check {![file exists $env(XDG_STATE_HOME)/agent-float-term/install.json]} "start had prior registration"
+    set socket $env(XDG_RUNTIME_DIR)/agent-float-term-[exec id -u]/tmux.sock
+    spawn -noecho $binary start
+    set client $spawn_id
+    stty rows 40 columns 120 < $spawn_out(slave,name)
+    eventually {expr {[file exists $env(XDG_STATE_HOME)/agent-float-term/install.json] && ![catch {attached 1} result] && $result}} "first start registers and attaches"
+    stable_command [binding root F7] "first start binding"
+    set input [open $env(XDG_STATE_HOME)/agent-float-term/install.json r]
+    set manifest [read $input]
+    close $input
+    check {[regexp {"format": 3} $manifest]} "start did not register format 3"
+    check {[string first $binary $manifest] >= 0} "start did not record stable opt path"
+    check {![file exists $env(XDG_DATA_HOME)/agent-float-term/current]} "start created managed current"
+    check {![file exists $env(HOME)/.local/bin/agent-float-term]} "start created managed binary"
+    check {![file exists $env(HOME)/.tmux.conf] && ![file exists $env(HOME)/.bashrc] && ![file exists $env(HOME)/.zshrc]} "start edited startup config"
+    type "exit\r"
+    expect -i $client eof {} timeout { error "start did not exit" }
+    catch {wait -i $client}
+    set client ""
+    puts "PASS: Homebrew first bind/start and external upgrade ([exec $tmux -V], package directories $package_mode :$package_group); stable root/restore commands, original watcher, shell state, cleanup, managed alternate XDG roots"
 } message options]
 if {$failed} {
     puts stderr "FAIL: $message"

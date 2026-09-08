@@ -1,4 +1,5 @@
-//! Explicit, user-local installation. Install/uninstall without `yes` are read-only previews.
+//! User-local installation. Install/uninstall without `yes` are read-only previews.
+//! Explicit bind/start also register verified Homebrew packages without startup config edits.
 //! `yes` authorizes payload/templates, not implicit edits to shell or tmux user configuration.
 //! Each user integration requires its own explicit configuration path; omitted integrations
 //! are retained on reinstall, except exact owned references migrated to a new layout.
@@ -370,7 +371,7 @@ fn homebrew_group() -> Option<u32> {
     Some(unsafe { (*result).gr_gid })
 }
 
-// Explicit registration trusts macOS's admin group or Linux's effective primary group
+// Package registration trusts macOS's admin group or Linux's effective primary group
 // ONLY on a verified same-prefix/formula opt -> Cellar route (or sibling bin symlink).
 // Linux also permits a group-writable prefix: install.sh creates it 0755 but retains
 // existing prefix modes. Ancestors ABOVE the prefix and the executable stay strict.
@@ -761,7 +762,61 @@ pub fn install(options: InstallOptions) -> Result<()> {
     install_at(&Paths::discover()?, options, &source)
 }
 
+/// Called only by explicit bind/start, after their basic runtime validation.
+pub(crate) fn register_homebrew() -> Result<()> {
+    let source = env::current_exe()?
+        .canonicalize()
+        .context("resolve running executable")?;
+    let Some(bin) = source
+        .parent()
+        .filter(|bin| bin.file_name().is_some_and(|n| n == "bin"))
+    else {
+        return Ok(());
+    };
+    let Some(formula) = bin.parent().and_then(Path::parent) else {
+        return Ok(());
+    };
+    if source.file_name().is_none_or(|name| name != BINARY)
+        || formula.file_name().is_none_or(|name| name != BINARY)
+        || formula
+            .parent()
+            .and_then(Path::file_name)
+            .is_none_or(|name| name != "Cellar")
+    {
+        // Cargo, archives, and source builds retain their explicit setup behavior.
+        return Ok(());
+    }
+    let prefix = formula
+        .parent()
+        .and_then(Path::parent)
+        .context("Homebrew prefix")?;
+    let stable = prefix.join("opt").join(BINARY).join("bin").join(BINARY);
+    let paths = Paths::discover()?;
+    if homebrew_directories(&stable).is_none() || verify_external(&paths, &stable)? != source {
+        bail!("Homebrew opt path must be trusted and resolve to the running executable; repair the package links and run {} bind or start", stable.display());
+    }
+    install_at_mode(
+        &paths,
+        InstallOptions {
+            external_binary: Some(stable),
+            yes: true,
+            ..InstallOptions::default()
+        },
+        &source,
+        true,
+    )
+}
+
 fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<()> {
+    install_at_mode(paths, options, source, false)
+}
+
+fn install_at_mode(
+    paths: &Paths,
+    options: InstallOptions,
+    source: &Path,
+    first_use: bool,
+) -> Result<()> {
     if let Some(path) = &options.external_binary {
         external_location(paths, path)?;
     }
@@ -779,6 +834,17 @@ fn install_at(paths: &Paths, options: InstallOptions, source: &Path) -> Result<(
         None
     };
     let (manifest_before, old) = manifest(paths)?;
+    if first_use {
+        if let Some(value) = &old {
+            match &value.external {
+                Some(external) if external.active && Some(&external.path) == options.external_binary.as_ref() => {
+                    // Do not regenerate templates or opt-in blocks on ordinary bind/start.
+                    return Ok(());
+                }
+                _ => bail!("Homebrew first-use registration conflicts with the existing installation mode or external path; explicitly uninstall the existing integration (review `agent-float-term uninstall`, then use --yes) before running this Homebrew binary's bind/start; retained user edits must be reviewed first"),
+            }
+        }
+    }
     let migrating = old.as_ref().is_some_and(|value| value.format == 1);
     let mut effective = options.clone();
     if let Some(value) = &old {

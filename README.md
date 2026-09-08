@@ -8,30 +8,30 @@ your AI CLI. Run your AI command normally in a tmux pane.
 Requires **tmux 3.4+** and macOS or Linux. Install your AI CLI normally.
 Homebrew supplies tmux; other methods require you to install it separately.
 
-**Publication pending:** Homebrew, crates.io, and release archives are prepared
-but not published yet. Use a Git source build until the respective channel is
-available. Choose one method; switching an existing installation requires the
+**Release note:** Cargo v0.2.2 is published. The simplified Homebrew setup below
+requires the next release containing first-use registration; v0.2.2 still uses
+[explicit setup](docs/installation.md#homebrew). Homebrew/archive downloads also
+require public [release assets](https://github.com/vuongvm812/agent-float-term/releases).
+Choose one method; switching an existing installation requires the
 [migration steps](docs/operations.md#switching-installation-methods).
 
 ### Homebrew
 
-After the stable release and tap formula are published:
+After the new stable release and tap formula are published:
 
 ```sh
 brew tap vuongvm812/tap
 brew install vuongvm812/tap/agent-float-term
-aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
-"$aft" install --external-binary "$aft"
-# Review the preview before applying:
-"$aft" install --external-binary "$aft" --yes
 ```
 
-Homebrew installs a release binary. Integration setup does not copy it elsewhere;
-`brew upgrade` owns binary updates. See [platform limits](docs/installation.md#homebrew).
+No separate application installation is needed. The first `agent-float-term bind`
+or interactive `agent-float-term start` registers Homebrew's stable binary path
+without copying it or editing startup files. Homebrew owns binary updates.
+See [platform limits](docs/installation.md#homebrew), then [activate](#activate).
 
 ### Cargo
 
-After the crate is published, using the default Cargo installation root:
+Using the default Cargo installation root:
 
 ```sh
 cargo install agent-float-term --locked
@@ -134,3 +134,7 @@ limits. This tool adds no telemetry or prompt logging; tmux is not a sandbox.
 [Contributing](CONTRIBUTING.md) | [Changelog](CHANGELOG.md) |
 [Publishing](docs/publishing.md) | [Release checklist](docs/release-checklist.md) |
 [MIT license](LICENSE)
+
+Maintainers: `make release DRY_RUN=1` previews the coordinated release plan;
+`make release` requires explicit confirmation before publishing GitHub assets,
+the Homebrew formula, and a missing Cargo version. See [release prerequisites](docs/publishing.md#make-release).

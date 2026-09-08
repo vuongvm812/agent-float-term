@@ -3,11 +3,106 @@
 Release archives, the Homebrew tap, and crates.io are separate publication steps.
 They must identify the same reviewed source version. Workflows do not create source
 commits or tags, publish a stable GitHub draft automatically, or push to the tap.
-This guide does not authorize publication by an automation agent.
+The local `make release` entry point can complete publication after explicit
+maintainer confirmation, including a formula-only tap commit/push. It never
+creates or moves application tags or commits application source. This guide does
+not authorize an automation agent to publish while implementing or testing tooling.
 
-Current state: release preparation exists locally, but no release, installable
-tap formula, or crate has been published. See the [release checklist](release-checklist.md)
-for acceptance gates and [installation](installation.md) for user-facing commands.
+Cargo v0.2.2 is already published. Current source adds coordinated publication and
+first-use Homebrew setup for a new release, not a replacement of old artifacts.
+See the [release checklist](release-checklist.md) for acceptance gates and
+[installation](installation.md) for user-facing commands.
+
+## Make Release
+
+Use this entry point to coordinate all three channels rather than executing the
+manual stages below separately:
+
+```sh
+# Local plan only, safe while reviewing uncommitted tooling:
+make release DRY_RUN=1
+
+# After preparing and pushing the reviewed version/tag:
+make release
+```
+
+The tag defaults to `v` plus the current `Cargo.toml` version. Override it with
+`TAG=vX.Y.Z` to resume an existing stable release; prereleases are not supported
+by this combined Homebrew release command. The selected tag must already exist
+locally and remotely and match its tagged `Cargo.toml` and `Cargo.lock`. Fix a
+version mismatch before tagging: the command never bumps versions or repairs tags.
+It publishes from an isolated clean checkout of that exact commit, even when the
+working branch contains newer release tooling.
+
+Prerequisites:
+
+- A clean application checkout on a named branch, synchronized with its intended
+  GitHub `origin`, including all release tooling pushed to the trusted default branch.
+- A clean tap checkout on its remote default branch, synchronized with
+  `vuongvm812/homebrew-tap`. The default location is the application checkout's
+  sibling `homebrew-tap`; override with `TAP_DIR=/absolute/path/to/homebrew-tap`.
+- Git, Make, Python 3.9+, Rust/Cargo 1.84.1, the native build toolchain, and `gh`.
+  GitHub CLI authentication must permit draft access, workflow dispatch, and
+  release publication and Actions artifact downloads; Git authentication must
+  permit a normal push to the tap.
+- Local Cargo publishing credentials configured through its credential provider
+  (for example `cargo login`). This command uses local Cargo credentials, **not**
+  the separate OIDC workflow. Do not start both publishers for the same version.
+- Reviewed release notes and completed release-checklist/platform acceptance.
+  Confirmation accepts release readiness; automation does not replace that review.
+
+`make release` asks you to type exactly `publish TAG`. Noninteractive use requires
+the same explicit confirmation, for example after approving a new `v0.2.3` tag:
+
+```sh
+make release TAG=v0.2.3 CONFIRM='publish v0.2.3'
+```
+
+Bare `make` displays help. `DRY_RUN=1` validates the local tag and prints the plan
+only: no temporary files, builds, remote checks, dispatches, commits, or uploads.
+It does not assert that credentials, remote assets, or the tap are ready.
+
+After confirmation, the command:
+
+1. Checks the immutable remote tag and locked tagged package. A missing crate
+   receives package-content verification and a Cargo publish dry run. An existing
+   crate is downloaded, checksum-verified, and checked against its recorded clean
+   Git source commit; a mismatch or yanked version stops the release.
+2. Reuses the tag's release, or dispatches the stable Release workflow and waits
+   up to one hour. Unique run IDs correlate dispatches. A single matching active
+   run is reused on retry; ambiguous runs stop instead of dispatching another.
+3. Requires a successful Release run and its immutable `release-verification`
+   Actions artifact, which binds the exact tag/source and hashes of all five
+   public assets to that build. Downloads the archives, checksums, and formula,
+   verifies those recorded hashes and archive layouts, and compares the formula
+   with output from the **tagged** generator/template. Then publishes a verified
+   draft, or leaves an already-public verified release unchanged.
+4. Commits/pushes only `Formula/agent-float-term.rb` to the tap using a normal push.
+   Identical published content is skipped. Downgrades, same-version/different
+   formulas, unrelated changes, and diverged history require manual review.
+5. Publishes a missing crate with `cargo +1.84.1 publish --locked --registry crates-io`,
+   then checks indexing and source provenance. An already-published matching
+   version is skipped, never uploaded again.
+
+Publication across services is **not atomic**. Run one coordinator per release.
+If a later stage fails, earlier stages may already be public; fix the reported
+blocker and rerun the same `TAG`. One unpushed, precisely identified formula-only
+commit created by this command can be resumed. Unrelated unpushed commits, failed
+hooks leaving edits, or remote advancement require manual reconciliation; nothing
+is reset or force-pushed. Concurrent coordinators are not a distributed transaction.
+
+Build evidence is retained for 90 days, subject to repository retention policy.
+Missing, expired, or inconsistent proof stops automated publication, even when
+editable release notes claim a successful run. Old drafts without that proof
+require manual review via the procedure below or a newly prepared release; a
+generic successful CI run is not proof of the binaries' origin. An interrupted
+workflow after proof upload should be inspected before retrying: rerunning jobs
+in the same run does not overwrite its immutable evidence artifact.
+
+The current `v0.2.2` tag and the published 0.2.2 crate recorded different source
+commits when checked during development. The coordinator intentionally refuses
+that combination. Publish these changes under a new matching version/tag rather
+than overwriting an existing crate version or moving its tag.
 
 ## Prepare The Source
 
@@ -90,8 +185,9 @@ For each stable release:
    resolved source/template, not a potentially newer default-branch template.
 2. Publish the stable GitHub release so the formula URLs resolve publicly.
 3. Place the reviewed formula asset in the tap's `Formula/agent-float-term.rb`.
-   Review the tap diff and commit/publish it as the maintainer. No workflow writes
-   cross-repository commits or uses a tap write token.
+   Review the tap diff and commit/publish it as the maintainer, or use the confirmed
+   `make release` coordinator. No GitHub workflow writes cross-repository commits
+   or uses a tap write token; the local coordinator uses your Git authentication.
 4. In disposable environments with the reviewed tap checkout, run actual Homebrew
    checks before advertising availability:
 
@@ -129,8 +225,9 @@ Crates.io distributes this program as source for
 The crate name is allocated on first successful publication; an earlier empty
 lookup is not a reservation. Published versions cannot be overwritten.
 
-Trusted Publishing currently requires an already-published crate, so the first
-publication is a separate maintainer action:
+Trusted Publishing currently requires an already-published crate. The initial
+publication of this project is complete; for a new crate, bootstrap with the
+following maintainer procedure or the confirmed local coordinator with a token:
 
 1. Sign in to crates.io, verify your email, and confirm the intended crate name.
    Create a short-lived API token authorized for the initial publication. Do not

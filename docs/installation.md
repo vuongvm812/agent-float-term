@@ -10,9 +10,10 @@ minimum. The CI dependency installer is for disposable runners, not host setup.
 Your terminal must deliver the configured shortcut to tmux; some keyboards need
 Fn+F7. Install your AI CLI normally; this project does not install AI tools.
 
-Homebrew, crates.io, and release archives are **not published yet**. Their
-commands below apply after the corresponding release is available. A Git source
-build is available now. Do not mix methods without first reviewing
+Cargo v0.2.2 is published. The first-use Homebrew flow below requires a newer
+release containing that change; it does not alter existing v0.2.2 binaries.
+Homebrew and archive downloads require the matching public GitHub assets.
+A Git source build is available now. Do not mix methods without first reviewing
 [switching installation methods](operations.md#switching-installation-methods).
 
 ## Homebrew
@@ -24,25 +25,40 @@ macOS 14+, Intel macOS 15+, and Linux x86_64 with glibc 2.35+. These conservativ
 limits follow the build hosts; older OS compatibility has not been established.
 Linux ARM64 and Alpine/musl have no formula binary. The formula depends on tmux.
 
-After the stable release and formula are public:
+After the release containing first-use registration and its formula are public:
 
 ```sh
+brew tap vuongvm812/tap
 brew install vuongvm812/tap/agent-float-term
+```
+
+Proceed to [activation](#activate): the first `bind` or interactive `start`
+validates the Homebrew layout and registers the stable `opt` path automatically.
+It creates only user-local integration templates and a manifest, not a binary
+copy or startup configuration edits. Root bindings and float helpers follow that
+path after `brew upgrade` and old-keg cleanup. Existing registrations are retained;
+conflicting installation modes/paths require explicit migration. `doctor`, help,
+and version checks remain read-only.
+
+This happens on first application use, **not in a Homebrew post-install hook**.
+The package install environment may not represent the eventual user's home;
+registration instead belongs to the user who actually runs the application.
+
+Older v0.2.2 binaries still need the explicit integration-only setup:
+
+```sh
 aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
 "$aft" install --external-binary "$aft"
 # Review, then apply the same options:
 "$aft" install --external-binary "$aft" --yes
 ```
 
-Use the stable `opt` prefix returned by `brew --prefix agent-float-term`, not a
-versioned `Cellar` path. Explicit registration lets root bindings and float
-helpers follow that stable path after `brew upgrade` and old-keg cleanup.
-The formula does not invoke the application installer or edit user startup files.
-Registration is the separate, explicit integration-only step.
+Use the stable `opt` prefix, not a versioned `Cellar` path. Do not substitute a new
+formula's instructions for capabilities absent from its actual release binary.
 
 ## Cargo
 
-After [the crate](https://crates.io/crates/agent-float-term) is published:
+Install from [crates.io](https://crates.io/crates/agent-float-term):
 
 ```sh
 cargo install agent-float-term --locked
@@ -83,9 +99,9 @@ plain managed installer on the Cargo executable for a fresh registration: use
 [Latest stable](https://github.com/vuongvm812/agent-float-term/releases/latest) |
 [Version 0.1.0](https://github.com/vuongvm812/agent-float-term/releases/tag/v0.1.0)
 
-No release is published yet. These downloads become available only after the
-maintainer publishes; drafts/prereleases do not populate the latest stable link.
-Until then, use a source build. Planned native archives plus `SHA256SUMS` are:
+Select an actually published release. Drafts are not public downloads and
+prereleases do not populate the latest stable link. The filenames below illustrate
+v0.1.0, not a guarantee that version is available. Native archives plus `SHA256SUMS` are:
 
 | Platform | Archive for v0.1.0 |
 | --- | --- |
@@ -98,8 +114,8 @@ archives target Ubuntu 22.04 / glibc 2.35; older glibc and Alpine/musl are not
 supported by those archives. macOS binaries are not notarized. Other platforms,
 including WSL2, remain unverified; native Windows is unsupported.
 
-After v0.1.0 is published, use a fresh download directory. This example selects
-macOS Apple Silicon; change `target` to the appropriate triple above:
+Use a fresh download directory. This example selects macOS Apple Silicon;
+set `version` to the published tag and `target` to the appropriate triple above:
 
 ```sh
 version=v0.1.0

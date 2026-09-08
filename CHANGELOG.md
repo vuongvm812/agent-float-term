@@ -5,6 +5,21 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+### Coordinated Publication And Homebrew First Use
+
+- Add `make release` with an exact confirmation prompt and a local plan-only
+  `DRY_RUN=1` mode. Coordinate verified GitHub archives, a formula-only tap
+  commit/push, and local Cargo publication from clean tagged source. Never create
+  or move source tags, overwrite release assets, or republish an existing crate.
+- Verify completed stages on retry, including crate source provenance. Reuse one
+  active release run, reject ambiguous runs and unsafe tap downgrades/edits, and
+  retain existing environment-protected OIDC publication as a manual alternative.
+- Homebrew now needs no separate application install command: first `bind` or
+  interactive `start` registers its verified stable opt path. No package install
+  hook writes to user homes; no binary copy or startup-file edits are implicit.
+  Help/version/doctor stay read-only, and conflicting installation modes/paths
+  require explicit migration. Existing v0.2.2 assets are unchanged.
+
 ### Homebrew And Cargo Release Preparation
 
 - Add `install --external-binary PATH` for native package-manager ownership.

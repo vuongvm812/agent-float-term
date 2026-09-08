@@ -31,7 +31,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Bind the configured key in an existing tmux server
+    /// Bind the configured key; first Homebrew use registers stable-path integration
     Bind {
         /// Existing tmux server socket
         #[arg(long, value_name = "PATH")]
@@ -40,7 +40,7 @@ enum Command {
         #[arg(long)]
         replace_key: bool,
     },
-    /// Open a normal shell in a dedicated tmux environment, not an AI CLI
+    /// Open a normal tmux shell; first Homebrew use registers stable-path integration
     Start,
     /// Diagnose dependencies, configuration, and a tmux server
     Doctor {

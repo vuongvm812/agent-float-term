@@ -794,6 +794,7 @@ pub fn bind(socket: Option<PathBuf>, replace_key: bool) -> Result<()> {
         binary_stamp(&tmux.binary)? == verified_stamp,
         "tmux executable changed while checking its version; retry bind"
     );
+    crate::install::register_homebrew()?;
     runtime_dir()?;
     let record_path = record_path(&tmux.socket)?;
     let _guard = lock(&record_path.with_extension("lock"))?;
@@ -1073,6 +1074,7 @@ pub fn start() -> Result<()> {
         tmux.compatible()?;
         binary = tmux.binary;
     }
+    crate::install::register_homebrew()?;
     let mut command = Command::new(&binary);
     let cwd = env::current_dir()?;
     command

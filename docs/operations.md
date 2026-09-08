@@ -54,9 +54,12 @@ The read-only preview lists these migration targets. `config.json` is untouched.
 
 ## Package-Managed Installation
 
-Homebrew and Cargo retain ownership of their executable. Register it once with
-`install --external-binary /absolute/stable/path`, review the preview, and repeat
-with `--yes`. See the [Homebrew and Cargo examples](installation.md). This mode
+Homebrew and Cargo retain ownership of their executable. Starting with the next
+Homebrew release, the first `bind` or interactive `start` registers the verified
+stable `opt` path automatically. The formula itself does not edit user homes.
+Cargo and older Homebrew binaries use explicit
+`install --external-binary /absolute/stable/path`, previewed before applying with
+`--yes`. See the [Homebrew and Cargo examples](installation.md). This mode
 creates only owned integrations and private installation state, not a binary
 copy, `current` link, release directory, or `~/.local/bin` link.
 
@@ -65,6 +68,14 @@ Homebrew's stable `opt` path or the actual Cargo installation-root `bin` path,
 not a versioned Cellar path or whichever old executable happens to be on PATH.
 Stable symlinks are retained in generated scripts and runtime helpers, so package
 replacement does not bake an old version into future helper commands.
+
+First-use Homebrew registration occurs after basic configuration/tmux validation;
+unavailable-server `bind` and non-TTY `start` do not register. A later key collision
+can leave the new registration intact without replacing that key. Exact active
+registrations skip setup, so ordinary bind/start does not refresh templates or
+edit opt-in startup blocks. Help, version, and doctor never register. Cargo/raw
+source paths are not guessed, and existing managed or conflicting external
+installations are not silently converted.
 
 Paths must have trusted root/current-user ownership and non-writable-by-others
 ancestry. Group-write is allowed only on the verified same-prefix/same-formula

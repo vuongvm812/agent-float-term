@@ -47,11 +47,19 @@ class AgentFloatTerm < Formula
     <<~EOS
       Homebrew owns the binary; this formula does not run the application's installer
       or modify your shell/tmux configuration.
-      Preview optional user integration using the stable Homebrew path:
-        #{opt_bin}/agent-float-term install --external-binary "#{opt_bin}/agent-float-term"
-      Apply that integration-only plan by adding --yes. No binary is copied into your home.
-      Editing shell/tmux configuration requires explicit --shell-config/--tmux-config paths;
-      include the same options in the preview and the --yes command.
+      No separate application installation is needed. Inside an existing tmux server, run:
+        agent-float-term bind
+      Or open a dedicated tmux shell from an interactive terminal:
+        agent-float-term start
+      First bind/start registers #{opt_bin}/agent-float-term and generates user-local
+      integration templates and a manifest. No binary is copied into your home, and no
+      startup configuration is edited. Existing installations require explicit migration.
+      Help, version, and doctor do not register integrations.
+
+      Optional startup configuration edits still require explicit flags. After first use:
+        agent-float-term install --tmux-config "$HOME/.tmux.conf"
+      Review the preview, then repeat with --yes. Shell startup likewise requires an
+      explicit --shell-config PATH and --shell-kind bash (or zsh).
 
       Preview integration removal with `agent-float-term uninstall`, then add --yes.
       Remove integration before `brew uninstall agent-float-term`; Homebrew alone owns upgrades
@@ -81,31 +89,50 @@ class AgentFloatTerm < Formula
     shell_config = home/"bashrc"
     tmux_config.write "# original tmux config\n"
     shell_config.write "# original shell config\n"
-    args = ["install", "--external-binary", binary.to_s,
-            "--tmux-config", tmux_config.to_s, "--shell-config", shell_config.to_s,
-            "--shell-kind", "bash"]
-    system binary, *args
-    refute_path_exists home/"xdg-state/agent-float-term/install.json"
-    assert_equal "# original tmux config\n", tmux_config.read
-    assert_equal "# original shell config\n", shell_config.read
-    system binary, *args, "--yes"
-    assert_path_exists home/"xdg-state/agent-float-term/install.json"
-    assert_match binary.to_s, (home/"xdg-data/agent-float-term/integration.tmux").read
-    assert_match "# BEGIN agent-float-term managed v1", tmux_config.read
-    assert_match "# BEGIN agent-float-term managed v1", shell_config.read
-    refute_path_exists home/".local/bin/agent-float-term"
-    refute_path_exists home/"xdg-data/agent-float-term/current"
-    refute_path_exists home/"xdg-data/agent-float-term/releases"
-    system binary, "uninstall"
-    assert_path_exists home/"xdg-state/agent-float-term/install.json"
-    system binary, "uninstall", "--yes"
-    refute_path_exists home/"xdg-state/agent-float-term/install.json"
-    refute_path_exists home/"xdg-data/agent-float-term/integration.tmux"
-    refute_path_exists home/"xdg-data/agent-float-term/integration.sh"
-    assert_equal "# original tmux config\n", tmux_config.read
-    assert_equal "# original shell config\n", shell_config.read
-    assert_path_exists binary
-    assert_equal original, Digest::SHA256.file(binary).hexdigest
-    system binary, "--version"
+    manifest = home/"xdg-state/agent-float-term/install.json"
+    socket = testpath/"tmux.sock"
+    begin
+      system "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "test", "sleep 120"
+      system binary, "--help"
+      system binary, "--version"
+      system binary, "doctor", "--socket", socket
+      refute_path_exists manifest
+      system binary, "bind", "--socket", socket
+      assert_path_exists manifest
+      assert_match '"format": 3', manifest.read
+      assert_match binary.to_s, manifest.read
+      assert_equal "# original tmux config\n", tmux_config.read
+      assert_equal "# original shell config\n", shell_config.read
+      before = manifest.read
+      system binary, "bind", "--socket", socket
+      assert_equal before, manifest.read
+      args = ["install", "--tmux-config", tmux_config.to_s, "--shell-config", shell_config.to_s,
+              "--shell-kind", "bash"]
+      system binary, *args
+      assert_equal before, manifest.read
+      assert_equal "# original tmux config\n", tmux_config.read
+      assert_equal "# original shell config\n", shell_config.read
+      system binary, *args, "--yes"
+      assert_path_exists home/"xdg-state/agent-float-term/install.json"
+      assert_match binary.to_s, (home/"xdg-data/agent-float-term/integration.tmux").read
+      assert_match "# BEGIN agent-float-term managed v1", tmux_config.read
+      assert_match "# BEGIN agent-float-term managed v1", shell_config.read
+      refute_path_exists home/".local/bin/agent-float-term"
+      refute_path_exists home/"xdg-data/agent-float-term/current"
+      refute_path_exists home/"xdg-data/agent-float-term/releases"
+      system binary, "uninstall"
+      assert_path_exists home/"xdg-state/agent-float-term/install.json"
+      system binary, "uninstall", "--yes"
+      refute_path_exists home/"xdg-state/agent-float-term/install.json"
+      refute_path_exists home/"xdg-data/agent-float-term/integration.tmux"
+      refute_path_exists home/"xdg-data/agent-float-term/integration.sh"
+      assert_equal "# original tmux config\n", tmux_config.read
+      assert_equal "# original shell config\n", shell_config.read
+      assert_path_exists binary
+      assert_equal original, Digest::SHA256.file(binary).hexdigest
+      system binary, "--version"
+    ensure
+      system "tmux", "-S", socket, "kill-server"
+    end
   end
 end

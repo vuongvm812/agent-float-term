@@ -84,7 +84,7 @@ jobs:
       - name: Formatting
         run: cargo +1.84.1 fmt --all -- --check
       - name: Release helper tests (including generated Ruby syntax)
-        run: python3 -B -m unittest discover -s scripts -p 'test_release_helpers.py' -v
+        run: python3 -B -m unittest discover -s scripts -p 'test_release*.py' -v
       - name: Clippy
         run: cargo +1.84.1 clippy --locked --all-targets -- -D warnings
       - name: Tests

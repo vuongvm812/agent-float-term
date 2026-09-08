@@ -28,7 +28,7 @@ class Formula
   def initialize(root)
     @testpath = root/"test"
     @testpath.mkpath
-    @opt_bin = root/"opt/agent-float-term/bin"
+    @opt_bin = root/"brew/opt/agent-float-term/bin"
   end
 
   def system(*args)
@@ -53,24 +53,33 @@ class Formula
 end
 
 load File.join(__dir__, "agent-float-term.rb.in")
-Dir.mktmpdir("aft-formula-") do |directory|
+raise "Formula must not write user state during Homebrew installation" if AgentFloatTerm.instance_methods(false).include?(:post_install)
+# Short private socket paths also work within macOS's sockaddr_un limit.
+Dir.mktmpdir("aft-formula-", "/tmp") do |directory|
   root = Pathname.new(directory).realpath
-  keg = root/"Cellar/agent-float-term/0.1.0"
+  prefix = root/"brew"
+  keg = prefix/"Cellar/agent-float-term/0.1.0"
   (keg/"bin").mkpath
   FileUtils.copy_file(source, keg/"bin/agent-float-term")
   File.chmod(0o755, keg/"bin/agent-float-term")
-  (root/"opt").mkpath
-  File.symlink(keg, root/"opt/agent-float-term")
+  (prefix/"opt").mkpath
+  File.symlink(keg, prefix/"opt/agent-float-term")
   if RUBY_PLATFORM.include?("darwin")
     admin = Etc.getgrnam("admin").gid
     if Process.groups.include?(admin)
       # Homebrew's package ancestry is commonly current-user:admin and 0775.
-      [root/"opt", root/"Cellar", keg.parent, keg, keg/"bin"].each do |path|
+      [prefix/"opt", prefix/"Cellar", keg.parent, keg, keg/"bin"].each do |path|
         File.chown(nil, admin, path)
         File.chmod(0o775, path)
       end
       puts "Testing group-writable admin-owned Homebrew package directories."
     end
+  else
+    [prefix, prefix/"opt", prefix/"Cellar", keg.parent, keg, keg/"bin"].each do |path|
+      File.chown(nil, Process.egid, path)
+      File.chmod(0o775, path)
+    end
+    puts "Testing group-writable primary-group Homebrew package directories."
   end
   AgentFloatTerm.new(root).run_test
 end
