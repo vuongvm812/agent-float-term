@@ -1,6 +1,6 @@
 # Harness Floating Terminal
 
-https://github.com/vuongvm812/agent-float-term/raw/main/docs/media/demo.mov
+![Floating terminal demo](docs/media/demo.gif)
 
 [![CI](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml/badge.svg)](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml)
 
