@@ -1,5 +1,7 @@
 # Harness Floating Terminal
 
+https://github.com/vuongvm812/agent-float-term/raw/main/docs/media/demo.mov
+
 [![CI](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml/badge.svg)](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml)
 
 An F7 floating shell beside Claude Code, Codex, or OpenCode, without wrapping
