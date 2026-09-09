@@ -5,6 +5,10 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+- Add `make uninstall` and its read-only `DRY_RUN=1` preview. Remove only the
+  managed installation and verified idle Make-created tmux builds; refuse busy
+  builds without stopping servers, and preserve unrelated compatibility clients.
+
 - Fix strict GNU patch application of the tmux status-mouse extension by using
   balanced unified-diff context. Expose build failures in CI output, add offline
   patch/logging regressions, and wait for asynchronous mouse-test binding cleanup.

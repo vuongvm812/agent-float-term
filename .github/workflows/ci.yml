@@ -54,7 +54,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential bison pkg-config libevent-dev libncurses-dev curl ca-certificates expect procps bash zsh neovim
+          sudo apt-get install --yes build-essential bison pkg-config libevent-dev libncurses-dev curl ca-certificates expect procps bash zsh neovim lsof
       - name: Build checksum-pinned tmux (Linux)
         if: runner.os == 'Linux'
         env:
@@ -85,8 +85,8 @@ jobs:
         run: cargo +1.84.1 fmt --all -- --check
       - name: Release helper tests (including generated Ruby syntax)
         run: python3 -B -m unittest discover -s scripts -p 'test_release*.py' -v
-      - name: Local install orchestration tests (no live installation)
-        run: python3 -B -m unittest discover -s scripts -p 'test_install_local.py' -v
+      - name: Local install/uninstall orchestration tests (no live installation)
+        run: python3 -B -m unittest discover -s scripts -p 'test_*local.py' -v
       - name: Tmux patch portability and build diagnostics
         run: python3 -B -m unittest discover -s scripts -p 'test_tmux_patch.py' -v
       - name: Clippy
@@ -95,6 +95,11 @@ jobs:
         run: cargo +1.84.1 test --locked --all-targets
       - name: Debug build
         run: cargo +1.84.1 build --locked
+      - name: Isolated native Make uninstall integration
+        timeout-minutes: 3
+        env:
+          AFT_UNINSTALL_TEST_BINARY: target/debug/agent-float-term
+        run: python3 -B -m unittest discover -s scripts -p 'test_uninstall_local.py' -v
       - name: Isolated Homebrew formula integration test (no brew installation)
         run: ruby scripts/test-homebrew-formula.rb target/debug/agent-float-term
       - name: Isolated PTY smoke test

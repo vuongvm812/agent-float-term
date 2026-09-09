@@ -67,6 +67,40 @@ same pinned hash. Sources, executable, and `build.log` stay in the new private
 directory. The builder neither installs tmux nor launches a server. The tests
 create and tear down only isolated servers, homes, and synthetic AI fixtures.
 
+## Uninstall
+
+To remove the managed application and the private tmux builds created by
+`make install`, run from the repository:
+
+```sh
+make uninstall DRY_RUN=1
+make uninstall
+```
+
+Python 3.9+ and `lsof` are required; macOS includes `lsof`, while Linux may need
+its distribution's `lsof` package. Use the same HOME/XDG roots as the installation.
+The target uses the repository's release binary or a checksum-verified installed
+binary; it does not compile or download anything. It checks every candidate build for
+open files before applying the application's ownership-aware uninstaller. It
+refuses if a build is in use or the check is inconclusive, and never stops a
+server automatically. Finish jobs and close those servers first; detaching a
+client does not stop its server. Do not start new servers during uninstall.
+
+New Make installs mark their build directories, including failed builds, for
+safe cleanup. Earlier builds are recognized only by the exact Make directory
+layout and pinned upstream archive checksum. Unmarked builds without that evidence,
+changed ownership markers, unexpected top-level files, unsafe paths, and foreign
+owners require manual review rather than recursive deletion by name alone.
+
+Only verified `compat/tmux-status-mouse.XXXXXXXX` directories are removed. Other
+tmux clients (including `compat/tmux-3.5a`), Homebrew/Cargo registrations, user
+config edits, and the repository's `target/` cache are preserved. The application
+uninstaller restores only its owned bindings/config blocks and may preserve
+edited installation files. Repeating removal after a successful uninstall is
+harmless. Builds are checked again immediately before removal; if one becomes
+busy or changes after the app is removed, it is retained and the command reports
+failure. This is not an atomic transaction across application and build removal.
+
 ## Server Requirement
 
 The application queries the **running server's** `#{aft_popup_status_mouse}`

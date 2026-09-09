@@ -32,6 +32,7 @@ umask 077
 compat="$data_home/agent-float-term/compat"
 mkdir -p -- "$compat"
 work=$(mktemp -d "$compat/tmux-status-mouse.XXXXXXXX")
+printf '%s\n' 'agent-float-term make install tmux v1' > "$work/.make-install-owned"
 # Never overwrite a tmux image: a previous build may still own a live server.
 patched=$(bash "$repo/scripts/build-mouse-tmux.sh" "$work/build")
 "$app" install --yes

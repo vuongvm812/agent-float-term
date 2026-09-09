@@ -28,7 +28,7 @@ expect tests/theme_smoke.exp target/debug/agent-float-term
 cargo +1.84.1 build --locked --release
 expect tests/external_smoke.exp target/release/agent-float-term
 python3 -B -m unittest discover -s scripts -p 'test_release*.py'
-python3 -B -m unittest discover -s scripts -p 'test_install_local.py'
+AFT_UNINSTALL_TEST_BINARY=target/debug/agent-float-term python3 -B -m unittest discover -s scripts -p 'test_*local.py'
 python3 -B -m unittest discover -s scripts -p 'test_tmux_patch.py'
 ruby scripts/test-homebrew-formula.rb target/release/agent-float-term
 # In a clean checkout of the source intended for packaging:
@@ -61,9 +61,11 @@ confirmed `make release` to test the tooling: it publishes releases and commits/
 pushes the tap formula. Use the offline tests and `make release DRY_RUN=1`; the
 latter is a local plan only, not a remote preflight. See [publishing](docs/publishing.md#make-release).
 
-Likewise, `make install` performs a real user-local install. Test its orchestration
-with `test_install_local.py` (fake build/install tools and temporary homes), or use
-`make install DRY_RUN=1`. Do not run the live install target merely to test it.
+Likewise, `make install` and `make uninstall` mutate the user-local installation.
+Test their orchestration with `test_*local.py` (fake tools and temporary homes),
+or use `DRY_RUN=1`. Never run live install/uninstall merely to test the targets.
+Uninstall coverage includes busy-build refusal using `lsof` against a temporary
+child process; Linux CI installs `lsof` so this check is not skipped.
 
 All five required Expect entry points accept the binary as their first argument.
 Each test owns creation and teardown of its isolated environment and must fail

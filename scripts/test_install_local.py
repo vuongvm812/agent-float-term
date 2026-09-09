@@ -81,6 +81,8 @@ printf '%s/tmux\n' "$1"
         for build in builds:
             self.assertEqual(build.stat().st_mode & 0o777, 0o700)
             self.assertTrue((build / "build").is_dir())
+            self.assertEqual((build / ".make-install-owned").read_text(),
+                             "agent-float-term make install tmux v1\n")
 
     def test_failures_stop_before_later_mutations(self):
         for failure, expected_count in (("FAIL_CARGO", 1), ("FAIL_PREVIEW", 2),

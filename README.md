@@ -74,6 +74,10 @@ clicking**, use `make install` instead. `make install DRY_RUN=1` previews the pl
 It does not restart tmux; follow the printed separate-server launch command.
 See [patched-server setup](docs/status-bar-mouse.md).
 
+To remove that managed installation and its idle Make-created tmux builds, run
+`make uninstall` (`DRY_RUN=1` previews). It refuses builds in use and never stops
+servers. See [uninstall details](docs/status-bar-mouse.md#uninstall).
+
 ### Activate
 
 Ensure the selected binary directory is on `PATH`: Homebrew's `bin`, Cargo's
