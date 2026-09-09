@@ -1,5 +1,7 @@
 # Harness Floating Terminal
 
+[![CI](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml/badge.svg)](https://github.com/vuongvm812/agent-float-term/actions/workflows/ci.yml)
+
 An F7 floating shell beside Claude Code, Codex, or OpenCode, without wrapping
 your AI CLI. Run your AI command normally in a tmux pane.
 
