@@ -112,6 +112,16 @@ Use `shortcut`, not `key`, and rebind the intended server after changing it.
 See [configuration details](docs/configuration.md) for safe shortcuts, advanced
 `shell`/`harness_paths`, file permissions, and XDG rules.
 
+## Keep in mind
+**If you are running AI CLIs (`claude`, `codex`, `opencode`) inside of a Tmux session then skip this**
+
+
+`agent-float-term` utilizes `tmux`'s popup window feature so for running AI CLIs
+**outside** of `tmux` session (plain terminal), run the below command first:
+```
+agent-float-term start
+```
+
 ## Compatible Versions
 
 | Dependency | Compatible / Tested Version |
@@ -129,7 +139,3 @@ limits. This tool adds no telemetry or prompt logging; tmux is not a sandbox.
 [Contributing](CONTRIBUTING.md) | [Changelog](CHANGELOG.md) |
 [Publishing](docs/publishing.md) | [Release checklist](docs/release-checklist.md) |
 [MIT license](LICENSE)
-
-Maintainers: `make release DRY_RUN=1` previews the coordinated release plan;
-`make release` requires explicit confirmation before publishing GitHub assets,
-the Homebrew formula, and a missing Cargo version. See [release prerequisites](docs/publishing.md#make-release).
