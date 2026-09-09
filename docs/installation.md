@@ -10,8 +10,9 @@ minimum. The CI dependency installer is for disposable runners, not host setup.
 Your terminal must deliver the configured shortcut to tmux; some keyboards need
 Fn+F7. Install your AI CLI normally; this project does not install AI tools.
 
-Cargo v0.2.2 is published. The first-use Homebrew flow below requires a newer
-release containing that change; it does not alter existing v0.2.2 binaries.
+The current published version is **0.3.4**. Automatic Homebrew detection during
+`install` and multi-server activation below are **pending the next release**;
+existing 0.3.4 binaries and the published tap formula are unchanged.
 Homebrew and archive downloads require the matching public GitHub assets.
 A Git source build is available now. Do not mix methods without first reviewing
 [switching installation methods](operations.md#switching-installation-methods).
@@ -25,36 +26,71 @@ macOS 14+, Intel macOS 15+, and Linux x86_64 with glibc 2.35+. These conservativ
 limits follow the build hosts; older OS compatibility has not been established.
 Linux ARM64 and Alpine/musl have no formula binary. The formula depends on tmux.
 
-After the release containing first-use registration and its formula are public:
+Install the package:
 
 ```sh
 brew tap vuongvm812/tap
 brew install vuongvm812/tap/agent-float-term
 ```
 
-Proceed to [activation](#activate): the first `bind` or interactive `start`
-validates the Homebrew layout and registers the stable `opt` path automatically.
-It creates only user-local integration templates and a manifest, not a binary
-copy or startup configuration edits. Root bindings and float helpers follow that
-path after `brew upgrade` and old-keg cleanup. Existing registrations are retained;
-conflicting installation modes/paths require explicit migration. `doctor`, help,
-and version checks remain read-only.
+Homebrew already links the executable into its prefix's `bin` directory:
+`/opt/homebrew/bin` on Apple Silicon, with other prefixes varying by installation.
+Do not add a managed copy to `~/.local/bin`. An older managed executable there can
+shadow Homebrew on PATH. Use the explicit stable binary below, but **review and
+uninstall the old managed registration before migrating**; choosing a different
+executable does not bypass conflicting existing state. Follow
+[switching installation methods](operations.md#switching-installation-methods).
 
-This happens on first application use, **not in a Homebrew post-install hook**.
-The package install environment may not represent the eventual user's home;
-registration instead belongs to the user who actually runs the application.
-
-Older v0.2.2 binaries still need the explicit integration-only setup:
+**Working 0.3.4 fallback:** after any required migration, explicitly register the
+package binary and opt into your tmux config, then bind from the intended existing
+server. Preview the same install options without `--yes` first:
 
 ```sh
 aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
-"$aft" install --external-binary "$aft"
-# Review, then apply the same options:
-"$aft" install --external-binary "$aft" --yes
+"$aft" install --external-binary "$aft" --tmux-config "$HOME/.tmux.conf" --yes
+"$aft" bind
 ```
+
+For an older running tmux server, use a trusted client matching that server's
+exact version, for example `AFT_TMUX_BINARY=/absolute/path/to/matching/tmux "$aft" bind`
+inside that server. Outside it, also select `--socket PATH`. See
+[client selection](operations.md#tmux-client-selection); do not restart live jobs
+to resolve a client mismatch. Version 0.3.4 needs this explicit bind step.
+
+**Pending next release:** after Homebrew returns, the user runs setup, not the
+formula. With the Homebrew executable selected on PATH, the command is
+`agent-float-term install --tmux-config "$HOME/.tmux.conf" --yes`. Prefer the
+explicit stable path to avoid an older copy on PATH:
+
+```sh
+aft="$(brew --prefix agent-float-term)/bin/agent-float-term"
+"$aft" install --tmux-config "$HOME/.tmux.conf"
+# Review, then apply the same options:
+"$aft" install --tmux-config "$HOME/.tmux.conf" --yes
+```
+
+`install` detects the native executable from a verified Cellar path and chooses
+external registration at the stable same-prefix `opt` path. It never copies,
+chmods, or deletes the Homebrew executable, or creates `~/.local/bin`. Explicit
+existing external registrations retain their mode/path; managed conflicts require
+explicit migration, never silent deletion. Root bindings and float helpers follow
+the stable path after `brew upgrade` and old-keg cleanup.
+
+After successful installation and release of its lock, the public command activates
+discovered existing servers. Only the agent binding is refreshed, not the full
+`~/.tmux.conf`. See [activation scope and retry behavior](operations.md#multi-server-activation).
+
+There is **no Homebrew `post_install` hook** for user setup. Homebrew's current
+`run_post_install` uses a temporary `HOME` and sandbox `deny_read_home`; it cannot
+be used to edit the eventual user's home. Setup is an explicit user command after
+Homebrew returns. First `bind` or interactive `start` can still register the
+verified Homebrew path without startup-file edits; `doctor`, help, and version
+checks remain read-only.
 
 Use the stable `opt` prefix, not a versioned `Cellar` path. Do not substitute a new
 formula's instructions for capabilities absent from its actual release binary.
+This change does not provision a patched tmux package. Status-bar mouse switching
+still requires a separately installed [patched running server](status-bar-mouse.md).
 
 ## Cargo
 
@@ -183,8 +219,18 @@ agent-float-term install --tmux-config "$HOME/.tmux.conf" --yes
 
 Select the config your server actually loads, which may instead be
 `$HOME/.config/tmux/tmux.conf`. Do not create a competing config for this tool or
-replace your tmux configuration wholesale. For a running server, use `bind` and
-the intended socket; review conflicts before using `--replace-key`.
+replace your tmux configuration wholesale. In 0.3.4, activate a running server
+separately with `bind` and the intended socket.
+
+**Pending next release:** public `install --yes --tmux-config PATH` calls
+`tmux::bind_all` only after the installer succeeds and releases its lock. Preview,
+plain `install --yes` without `--tmux-config`, and shell-only installation do not
+auto-activate, even when a previous tmux integration is retained. Activation
+refreshes only the agent binding, not the full config. No existing servers is a
+successful no-op; partial activation returns an error **after the config is
+installed**. Resolve reported conflicts/client issues and retry `bind --all`.
+It never forces a conflicting key or starts, restarts, or deletes servers. See
+[discovery limits](operations.md#multi-server-activation).
 
 Shell integration can be selected independently for automatic startup:
 
@@ -207,9 +253,11 @@ refused. `update` replaces only the binary, not the templates; see
 
 For a registered Homebrew/Cargo installation, plain `install` retains its external
 mode/path and refreshes only owned templates when applied. If selecting startup
-files during the **first** registration, include `--external-binary "$aft"`
-alongside those flags. Registration checks that the path resolves to the running
-executable; run it from the selected package, not a different copy on PATH.
+files during the **first** Cargo registration or with Homebrew 0.3.4, include
+`--external-binary "$aft"` alongside those flags. The next release detects verified
+native Homebrew paths automatically during `install`. Registration checks that
+the path resolves to the running executable; run it from the selected package,
+not a different copy on PATH.
 
 The earlier config-directory layout is an exception to unselected-block retention:
 reinstall also migrates exact recorded references to the data directory. The

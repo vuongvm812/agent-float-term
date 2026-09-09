@@ -45,21 +45,20 @@ class AgentFloatTerm < Formula
 
   def caveats
     <<~EOS
-      Homebrew owns the binary; this formula does not run the application's installer
-      or modify your shell/tmux configuration.
-      No separate application installation is needed. Inside an existing tmux server, run:
-        agent-float-term bind
-      Or open a dedicated tmux shell from an interactive terminal:
-        agent-float-term start
-      First bind/start registers #{opt_bin}/agent-float-term and generates user-local
-      integration templates and a manifest. No binary is copied into your home, and no
-      startup configuration is edited. Existing installations require explicit migration.
-      Help, version, and doctor do not register integrations.
+      Homebrew links the command into its prefix/bin (/opt/homebrew/bin on Apple Silicon).
+      Complete user setup explicitly, outside Homebrew's sandbox:
+        "#{opt_bin}/agent-float-term" install --tmux-config "$HOME/.tmux.conf" --yes
+      Omit --yes to preview. The binary stays Homebrew-owned at its stable opt path;
+      no application copy is created in ~/.local/bin. Installation updates only its
+      managed config block and hot-reloads its binding on discoverable existing tmux
+      servers, without restarting them or sourcing unrelated config commands.
+      Conflicting keys and unavailable matching clients are reported, not forced.
+      Retry activation alone with `agent-float-term bind --all` after resolving them.
 
-      Optional startup configuration edits still require explicit flags. After first use:
-        agent-float-term install --tmux-config "$HOME/.tmux.conf"
-      Review the preview, then repeat with --yes. Shell startup likewise requires an
-      explicit --shell-config PATH and --shell-kind bash (or zsh).
+      An older managed copy in ~/.local/bin can shadow Homebrew. Existing managed or
+      conflicting external registrations require explicit uninstall/reinstall migration;
+      this command will not silently replace them. Help, version, and doctor stay read-only.
+      Shell startup edits still require --shell-config PATH and --shell-kind bash (or zsh).
 
       Preview integration removal with `agent-float-term uninstall`, then add --yes.
       Remove integration before `brew uninstall agent-float-term`; Homebrew alone owns upgrades
@@ -90,36 +89,42 @@ class AgentFloatTerm < Formula
     tmux_config.write "# original tmux config\n"
     shell_config.write "# original shell config\n"
     manifest = home/"xdg-state/agent-float-term/install.json"
-    socket = testpath/"tmux.sock"
+    # Scope discovery so this test cannot touch a user's default tmux server.
+    ENV["TMUX_TMPDIR"] = (home/"tmux-sockets").to_s
+    socket_dir = home/"tmux-sockets/tmux-#{Process.euid}"
+    socket_dir.mkpath
+    File.chmod(0o700, socket_dir)
+    socket = socket_dir/"default"
     begin
       system "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", "test", "sleep 120"
       system binary, "--help"
       system binary, "--version"
       system binary, "doctor", "--socket", socket
       refute_path_exists manifest
-      system binary, "bind", "--socket", socket
-      assert_path_exists manifest
-      assert_match '"format": 3', manifest.read
-      assert_match binary.to_s, manifest.read
-      assert_equal "# original tmux config\n", tmux_config.read
-      assert_equal "# original shell config\n", shell_config.read
-      before = manifest.read
-      system binary, "bind", "--socket", socket
-      assert_equal before, manifest.read
+      before_sessions = Utils.safe_popen_read("tmux", "-S", socket.to_s, "list-sessions", "-F", '#{session_id}|#{pid}')
       args = ["install", "--tmux-config", tmux_config.to_s, "--shell-config", shell_config.to_s,
               "--shell-kind", "bash"]
       system binary, *args
-      assert_equal before, manifest.read
+      refute_path_exists manifest
       assert_equal "# original tmux config\n", tmux_config.read
       assert_equal "# original shell config\n", shell_config.read
       system binary, *args, "--yes"
-      assert_path_exists home/"xdg-state/agent-float-term/install.json"
+      assert_path_exists manifest
+      assert_match '"format": 3', manifest.read
+      assert_match binary.to_s, manifest.read
       assert_match binary.to_s, (home/"xdg-data/agent-float-term/integration.tmux").read
       assert_match "# BEGIN agent-float-term managed v1", tmux_config.read
       assert_match "# BEGIN agent-float-term managed v1", shell_config.read
       refute_path_exists home/".local/bin/agent-float-term"
       refute_path_exists home/"xdg-data/agent-float-term/current"
       refute_path_exists home/"xdg-data/agent-float-term/releases"
+      assert_equal before_sessions, Utils.safe_popen_read("tmux", "-S", socket.to_s, "list-sessions", "-F", '#{session_id}|#{pid}')
+      assert_match "Owned key binding: intact", Utils.safe_popen_read(binary.to_s, "doctor", "--socket", socket.to_s)
+      before = manifest.read
+      system binary, *args, "--yes"
+      assert_equal before, manifest.read
+      system binary, "bind", "--all"
+      assert_equal before, manifest.read
       system binary, "uninstall"
       assert_path_exists home/"xdg-state/agent-float-term/install.json"
       system binary, "uninstall", "--yes"

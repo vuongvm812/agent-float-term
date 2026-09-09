@@ -13,12 +13,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Preview a user-local install; apply only with --yes
+    /// Preview a user-local install; apply only with --yes (Homebrew retains its binary)
     Install {
         /// Integration-only install; the package manager owns this stable executable
         #[arg(long, value_name = "ABSOLUTE_STABLE_PATH")]
         external_binary: Option<PathBuf>,
-        /// Explicitly opt into editing this tmux configuration
+        /// Edit this tmux config and activate existing servers when applied with --yes
         #[arg(long, value_name = "PATH")]
         tmux_config: Option<PathBuf>,
         /// Explicitly opt into editing this shell configuration
@@ -33,6 +33,9 @@ enum Command {
     },
     /// Bind the configured key; first Homebrew use registers stable-path integration
     Bind {
+        /// Hot-reload existing owned servers without replacing conflicting keys
+        #[arg(long, conflicts_with_all = ["socket", "replace_key"])]
+        all: bool,
         /// Existing tmux server socket
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
@@ -126,9 +129,16 @@ fn run(cli: Cli) -> Result<()> {
             yes,
         }),
         Command::Bind {
+            all,
             socket,
             replace_key,
-        } => tmux::bind(socket, replace_key),
+        } => {
+            if all {
+                tmux::bind_all()
+            } else {
+                tmux::bind(socket, replace_key)
+            }
+        }
         Command::Start => tmux::start(),
         Command::Doctor { socket } => tmux::doctor(socket),
         Command::Sessions { socket } => tmux::sessions(socket),
@@ -196,6 +206,9 @@ mod tests {
         assert!(!help.contains("navigation-to-main"));
         assert!(help.contains("Preview a user-local install"));
         assert!(Cli::try_parse_from(["aft", "start"]).is_ok());
+        assert!(Cli::try_parse_from(["aft", "bind", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["aft", "bind", "--all", "--socket", "/tmp/s"]).is_err());
+        assert!(Cli::try_parse_from(["aft", "bind", "--all", "--replace-key"]).is_err());
         assert!(Cli::try_parse_from(["aft", "start", "claude"]).is_err());
         assert!(Cli::try_parse_from(["aft", "start", "--socket", "/tmp/s"]).is_err());
         assert!(matches!(

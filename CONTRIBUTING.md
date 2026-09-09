@@ -56,6 +56,21 @@ They must not attach to or kill an unrelated server, edit real startup files,
 or clean up user sessions. Cleanup traps should target only resources the test
 created. Keep fixture output synthetic; never record real prompts or secrets.
 
+**Post-install activation isolation:** tests invoking the public
+`install --tmux-config PATH --yes` must set a private `TMUX_TMPDIR` as well as
+private `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and
+`XDG_RUNTIME_DIR`, and unset inherited `TMUX`. HOME/XDG isolation alone does not
+exclude the real default `/tmp/tmux-UID` server. Explicit `TMUX_TMPDIR` scopes
+that discovery source with no default `/tmp` fallback; any fixture `TMUX` value
+must identify a test-owned socket. Keep binding records and the dedicated socket
+under the same private roots. This also applies to `bind --all` tests.
+
+The real formula test uses private temporary roots, including tmux discovery
+roots. Preserve that isolation. The Ruby formula-DSL harness is not a full
+Homebrew install/sandbox test. Do not add a user-home-writing `post_install` hook:
+Homebrew's `run_post_install` uses temporary HOME and `deny_read_home`. User setup
+is an explicit application command after Homebrew returns.
+
 Release orchestration tests mock Git/GitHub/Cargo/network mutations. Do not run
 confirmed `make release` to test the tooling: it publishes releases and commits/
 pushes the tap formula. Use the offline tests and `make release DRY_RUN=1`; the
@@ -123,6 +138,18 @@ deferred retry, SSH/disable/recursion skips, foreign-key preservation, and plain
 reinstall template refresh with the recorded shell kind and unselected configs
 retained. `update` must remain distinguishable from template refresh.
 
+Keep regressions for verified Cellar-to-same-prefix-opt external registration,
+package executable preservation, no `~/.local/bin` creation, retention of explicit
+external registrations, and managed conflicts requiring explicit migration.
+Automatic post-install `tmux::bind_all` must be limited to successful public
+`install --yes --tmux-config PATH`, after the installer lock is released;
+preview, plain `--yes`, and shell-only paths must not activate. Cover bounded
+noncreating discovery, inode alias deduplication, override scoping, no-server
+success, partial failure after config installation, foreign-key refusal, and
+`--all` argument conflicts.
+Existing-server operations must retain tmux `-N`; never start/restart/delete a
+server or source the user's full tmux config to implement activation.
+
 Inspector/core PTY worker fixtures must preserve the conservative boundary:
 at most 64 foreground group members, verified frontend ancestry, helper stdin
 from pipe/socket or `/dev/null`, terminal stdout/stderr allowed, and rejection of
@@ -179,6 +206,12 @@ bracket. Warm version-cache reuse must remain tied to executable metadata,
 server version, and the server-global generation; batching must not drop global
 detach-policy or ownership checks.
 
+Retain recorded matching-client recovery after a primary protocol failure and
+safe exact-version compatibility-cache reuse without an explicit
+`AFT_TMUX_BINARY` override. Cache data roots stay private; owned nested 0755
+directories are allowed, group/world-writable paths are not. Unsafe/missing
+compatible clients must be reported without default downloads or server restarts.
+
 ## Optional Benchmark
 
 After building, select an absolute path to a trusted tmux 3.4+ executable:
@@ -206,12 +239,19 @@ end-to-end guarantee.
 
 ## Validation Status
 
-Record focused bugfix runs separately from full-suite totals. The latest macOS
+For the unreleased Homebrew install/activation change, the Rust suites passed
+**102 tests on macOS ARM64 and 100 on non-root Debian 12 ARM64**, including 10
+installer and 13 client/discovery tests. The isolated Ruby formula-DSL check passed
+on both platforms; all five macOS smoke suites and the Linux keyboard/Neovim suite
+passed. These are local results, not a real Homebrew package installation, published
+0.3.4 behavior, or remote CI evidence.
+
+Record focused bugfix runs separately from full-suite totals. An earlier macOS
 autostart run passed with 31-44 ms command/shell-snapshot checks and zero
 autostarts; core PTY worker, inspector, and installer checks also passed. The
-latest full Linux Rust run passed 57 tests (50 library + 2 CLI + 1 installer +
+then-current full Linux Rust run passed 57 tests (50 library + 2 CLI + 1 installer +
 4 tmux-client). macOS `cargo test --test tmux_client` passed all four tests; the
-expected 59-test full suite still needs a recorded final run. Release/package
+then-expected 59-test full suite still needed a recorded final run. Release/package
 reruns remain pending. Live F7 was confirmed before optimization, but latest
 deployment and live full-profile latency/theme acceptance remain pending.
 Neither live F7 nor `doctor` recognition is model-interaction acceptance.

@@ -5,6 +5,10 @@ evidence that the implementation or compatibility testing is complete.
 
 ## Unreleased
 
+The current published version is **0.3.4**. The Homebrew install/activation fix
+below is pending the next release; published binaries and the tap formula are
+unchanged. No crate version or tag change is implied.
+
 - Add `make uninstall` and its read-only `DRY_RUN=1` preview. Remove only the
   managed installation and verified idle Make-created tmux builds; refuse busy
   builds without stopping servers, and preserve unrelated compatibility clients.
@@ -12,6 +16,45 @@ evidence that the implementation or compatibility testing is complete.
 - Fix strict GNU patch application of the tmux status-mouse extension by using
   balanced unified-diff context. Expose build failures in CI output, add offline
   patch/logging regressions, and wait for asynchronous mouse-test binding cleanup.
+
+### Homebrew Install And Existing-Server Activation
+
+- Detect the native Homebrew executable from a verified Cellar path during
+  `install`, registering its stable same-prefix `opt` path as external. Never
+  copy, chmod, or delete the package executable or create `~/.local/bin`. Retain
+  explicit existing external registrations; require explicit migration for
+  managed conflicts rather than silently deleting the old install.
+- Keep user setup outside Homebrew: no `post_install` hook or first-use
+  bind/start startup-file edits. Homebrew already links prefix/bin; the user runs
+  `agent-float-term install --tmux-config "$HOME/.tmux.conf" --yes` after Homebrew
+  returns. Its `run_post_install` uses temporary HOME and `deny_read_home`.
+  Document the explicit stable-path 0.3.4 fallback and reviewed migration for
+  old managed binaries that shadow Homebrew.
+- After successful public `install --yes --tmux-config PATH` returns from the
+  installer and releases its lock, call `tmux::bind_all`. Preview, plain `--yes`
+  without `--tmux-config`, and shell-only installation do not auto-activate.
+- Add `bind --all`, incompatible with `--socket` and `--replace-key`. Discover
+  existing user-owned sockets from valid binding records, current `TMUX`,
+  `TMUX_TMPDIR/tmux-UID` or default `/tmp/tmux-UID`, `XDG_RUNTIME_DIR/tmux-UID`,
+  and the app's dedicated socket. Explicit `TMUX_TMPDIR` disables the default
+  fallback. Discovery is noncreating, bounded to 256 entries/32 servers/60 seconds,
+  and deduplicates aliases by inode; arbitrary custom sockets need `bind --socket`.
+- Refresh only the agent binding, never source the full tmux config or force a
+  foreign-key conflict. Never start, restart, or delete servers; existing-server
+  operations use tmux `-N`. Missing/no existing servers succeed with exit 0.
+  Partial activation reports an error after config installation; resolve the
+  reported issue and retry `bind --all`.
+- Reuse an approved recorded matching client even after primary protocol failure.
+  When needed without an explicit `AFT_TMUX_BINARY` override, reuse a safe existing
+  exact `data/compat/tmux-VERSION/bin/tmux` client. Keep the data root private and
+  nested directories owned/non-writable by others (0755 allowed). Report unsafe
+  or unavailable compatible clients; do not download clients by default. No
+  patched-tmux package provisioning is added; mouse support still needs a patched
+  running server.
+- Focused local validation reported by the implementing agent: 10 `install_binary`
+  and 13 `tmux_client` tests passed, plus isolated Ruby formula-DSL validation
+  against the latest debug binary. Full-suite validation remains pending; this
+  is not a full Homebrew installation test or remote CI evidence.
 
 ### Status-Bar Mouse Switching
 
@@ -46,11 +89,12 @@ evidence that the implementation or compatibility testing is complete.
 - Verify completed stages on retry, including crate source provenance. Reuse one
   active release run, reject ambiguous runs and unsafe tap downgrades/edits, and
   retain existing environment-protected OIDC publication as a manual alternative.
-- Homebrew now needs no separate application install command: first `bind` or
+- Homebrew first-use registration remains available: first `bind` or
   interactive `start` registers its verified stable opt path. No package install
   hook writes to user homes; no binary copy or startup-file edits are implicit.
   Help/version/doctor stay read-only, and conflicting installation modes/paths
-  require explicit migration. Existing v0.2.2 assets are unchanged.
+  require explicit migration. Explicit config setup and the 0.3.4 fallback are
+  documented above and in [installation](docs/installation.md#homebrew).
 
 ### Homebrew And Cargo Release Preparation
 
@@ -66,7 +110,8 @@ evidence that the implementation or compatibility testing is complete.
 - Add crate-content verification, package-path permissions/ownership regressions,
   and isolated upgrade coverage for unchanged bindings and running watchers.
 - Separate Homebrew, Cargo, release archive, and Git source instructions. Cargo
-  still compiles locally; publication of all distribution channels remains pending.
+  still compiles locally; publication of all distribution channels was pending
+  at that preparation stage, not a statement of current 0.3.4 availability.
 
 ### Generated Integration Layout
 
@@ -245,6 +290,8 @@ final full-suite or packaged-binary reruns are complete.
 - Authenticated/generating-session acceptance for all three harnesses.
 - WSL2 verification; Linux ARM64 remains source-build-only despite local evidence.
 - Eventual public-release download/install/update/rollback/uninstall acceptance. Local macOS archive
-  packaging and smoke checks are complete; no release is published.
+  packaging and smoke checks were complete at that historical checkpoint, before
+  publication. This does not establish acceptance of the new unreleased flow.
 
-No published 0.1.0 release or completed validation matrix is asserted here.
+These historical 0.1.0 release-candidate notes do not assert a completed validation
+matrix for the current published 0.3.4 or the unreleased changes above.

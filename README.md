@@ -8,26 +8,22 @@ your AI CLI. Run your AI command normally in a tmux pane.
 Requires **tmux 3.4+** and macOS or Linux. Install your AI CLI normally.
 Homebrew supplies tmux; other methods require you to install it separately.
 
-**Release note:** Cargo v0.2.2 is published. The simplified Homebrew setup below
-requires the next release containing first-use registration; v0.2.2 still uses
-[explicit setup](docs/installation.md#homebrew). Homebrew/archive downloads also
-require public [release assets](https://github.com/vuongvm812/agent-float-term/releases).
+**Release note:** The current published version is **0.3.4**. Automatic Homebrew
+detection during `install` and multi-server activation are **unreleased, pending
+the next release**; the published tap formula is unchanged. Use the
+[0.3.4 fallback](docs/installation.md#homebrew) until then.
 Choose one method; switching an existing installation requires the
 [migration steps](docs/operations.md#switching-installation-methods).
 
 ### Homebrew
 
-After the new stable release and tap formula are published:
+Install the package:
 
 ```sh
 brew tap vuongvm812/tap
 brew install vuongvm812/tap/agent-float-term
+agent-float-term install --tmux-config "$HOME/.tmux.conf" --yes
 ```
-
-No separate application installation is needed. The first `agent-float-term bind`
-or interactive `agent-float-term start` registers Homebrew's stable binary path
-without copying it or editing startup files. Homebrew owns binary updates.
-See [platform limits](docs/installation.md#homebrew), then [activate](#activate).
 
 ### Cargo
 
@@ -45,17 +41,6 @@ aft="${CARGO_HOME:-$HOME/.cargo}/bin/agent-float-term"
 Rust 1.84.1 is the release toolchain. Cargo owns the executable and updates;
 see [custom installation roots](docs/installation.md#cargo) if your Cargo settings
 override the default.
-
-### Release Archives
-
-After publication, download the archive for your OS/architecture from
-[GitHub Releases](https://github.com/vuongvm812/agent-float-term/releases), verify
-its entry in `SHA256SUMS`, then run the extracted binary's `install` preview and
-repeat with `--yes`. No Rust compiler is needed.
-
-Follow the [download and verification commands](docs/installation.md#release-archives).
-The installer owns a local copy at `~/.local/bin/agent-float-term`; do not copy a
-regular executable to that destination before running the installer.
 
 ### Build From Source
 

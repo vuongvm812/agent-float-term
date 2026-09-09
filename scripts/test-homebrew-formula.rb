@@ -4,11 +4,21 @@ require "digest"
 require "etc"
 require "fileutils"
 require "pathname"
+require "open3"
 require "tmpdir"
 
 abort "Usage: ruby scripts/test-homebrew-formula.rb NATIVE_BINARY" unless ARGV.length == 1
 source = Pathname.new(ARGV.fetch(0)).realpath
 abort "Expected an executable native binary" unless source.file? && source.executable?
+
+module Utils
+  def self.safe_popen_read(*args)
+    output, status = Open3.capture2(*args.map(&:to_s))
+    raise "Command failed: #{args.inspect}" unless status.success?
+
+    output
+  end
+end
 
 class Formula
   def self.desc(_value); end

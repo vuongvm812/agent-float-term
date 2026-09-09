@@ -759,22 +759,29 @@ pub fn install(options: InstallOptions) -> Result<()> {
     let source = env::current_exe()?
         .canonicalize()
         .context("resolve running executable")?;
-    install_at(&Paths::discover()?, options, &source)
+    let activate = options.yes && options.tmux_config.is_some();
+    let preview_activation = !options.yes && options.tmux_config.is_some();
+    install_at(&Paths::discover()?, options, &source)?;
+    if preview_activation {
+        println!("Applying will also activate the agent binding on discoverable existing tmux servers, without restarting servers or replacing conflicting keys.");
+    }
+    if activate {
+        crate::tmux::bind_all().context(
+            "installation/configuration succeeded, but live tmux activation was incomplete; resolve the reported server issues and retry `agent-float-term bind --all`",
+        )?;
+    }
+    Ok(())
 }
 
-/// Called only by explicit bind/start, after their basic runtime validation.
-pub(crate) fn register_homebrew() -> Result<()> {
-    let source = env::current_exe()?
-        .canonicalize()
-        .context("resolve running executable")?;
+fn homebrew_binary(paths: &Paths, source: &Path) -> Result<Option<PathBuf>> {
     let Some(bin) = source
         .parent()
         .filter(|bin| bin.file_name().is_some_and(|n| n == "bin"))
     else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(formula) = bin.parent().and_then(Path::parent) else {
-        return Ok(());
+        return Ok(None);
     };
     if source.file_name().is_none_or(|name| name != BINARY)
         || formula.file_name().is_none_or(|name| name != BINARY)
@@ -784,17 +791,28 @@ pub(crate) fn register_homebrew() -> Result<()> {
             .is_none_or(|name| name != "Cellar")
     {
         // Cargo, archives, and source builds retain their explicit setup behavior.
-        return Ok(());
+        return Ok(None);
     }
     let prefix = formula
         .parent()
         .and_then(Path::parent)
         .context("Homebrew prefix")?;
     let stable = prefix.join("opt").join(BINARY).join("bin").join(BINARY);
-    let paths = Paths::discover()?;
-    if homebrew_directories(&stable).is_none() || verify_external(&paths, &stable)? != source {
+    if homebrew_directories(&stable).is_none()
+        || verify_external(paths, &stable)? != source.canonicalize()?
+    {
         bail!("Homebrew opt path must be trusted and resolve to the running executable; repair the package links and run {} bind or start", stable.display());
     }
+    Ok(Some(stable))
+}
+
+/// Called only by explicit bind/start, after their basic runtime validation.
+pub(crate) fn register_homebrew() -> Result<()> {
+    let source = env::current_exe()?.canonicalize()?;
+    let paths = Paths::discover()?;
+    let Some(stable) = homebrew_binary(&paths, &source)? else {
+        return Ok(());
+    };
     install_at_mode(
         &paths,
         InstallOptions {
@@ -817,11 +835,17 @@ fn install_at_mode(
     source: &Path,
     first_use: bool,
 ) -> Result<()> {
+    let homebrew = if options.external_binary.is_none() {
+        homebrew_binary(paths, source)?
+    } else {
+        None
+    };
     if let Some(path) = &options.external_binary {
         external_location(paths, path)?;
     }
     integration(paths, &options)?;
     if options.external_binary.is_some()
+        || homebrew.is_some()
         || read_manifest(paths)?
             .1
             .is_some_and(|value| value.external.is_some() || value.format == 3)
@@ -847,8 +871,18 @@ fn install_at_mode(
     }
     let migrating = old.as_ref().is_some_and(|value| value.format == 1);
     let mut effective = options.clone();
+    // A Homebrew install must never create a second binary in ~/.local/bin.
+    // Retain shipped explicit external registrations on plain reinstall.
+    if effective.external_binary.is_none()
+        && old
+            .as_ref()
+            .and_then(|value| value.external.as_ref())
+            .is_none()
+    {
+        effective.external_binary = homebrew;
+    }
     if let Some(value) = &old {
-        match (&value.external, &options.external_binary) {
+        match (&value.external, &effective.external_binary) {
             (Some(external), requested) => {
                 if !external.active {
                     bail!("external integrations were uninstalled with residual user edits; review the retained content and finish uninstall before reinstalling");

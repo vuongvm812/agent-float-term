@@ -1,7 +1,7 @@
 //! Exercise the public installer against executable payloads, not only file fixtures.
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
@@ -30,6 +30,7 @@ fn invoke(binary: &Path, home: &Path, args: &[&str]) -> Output {
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("XDG_RUNTIME_DIR", home.join("runtime"))
+        .env("TMUX_TMPDIR", home.join("tmux-sockets"))
         .env("SHELL", "/bin/sh")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
@@ -43,7 +44,9 @@ fn invoke(binary: &Path, home: &Path, args: &[&str]) -> Output {
 fn success(output: Output) -> String {
     assert!(
         output.status.success(),
-        "{}",
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
@@ -83,7 +86,15 @@ impl BrewFixture {
         )
         .unwrap();
         let stable = prefix.join("opt/agent-float-term/bin/agent-float-term");
-        let socket = home.join("s");
+        let socket = home
+            .join("tmux-sockets")
+            .join(format!("tmux-{}", fs::metadata(&home).unwrap().uid()))
+            .join("default");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(socket.parent().unwrap())
+            .unwrap();
         success(invoke(
             Path::new("tmux"),
             &home,
@@ -336,6 +347,120 @@ fn generic_package_roots_do_not_autoregister_on_bind() {
 }
 
 #[test]
+fn homebrew_install_keeps_package_binary_and_hot_reloads_existing_server() {
+    for entry in [
+        "opt/agent-float-term/bin/agent-float-term",
+        "bin/agent-float-term",
+        "Cellar/agent-float-term/1/bin/agent-float-term",
+    ] {
+        let f = BrewFixture::new();
+        let binary = f.home.join("brew").join(entry);
+        let config = f.home.join(".tmux.conf");
+        let unwanted = f.home.join("whole-config-was-sourced");
+        let original = format!(
+            "# user settings\nrun-shell \"touch {}\"\n",
+            agent_float_term::install::shell_quote(unwanted.to_str().unwrap())
+        );
+        fs::write(&config, &original).unwrap();
+        let payload = fs::read(&f.keg).unwrap();
+        let server = || {
+            success(invoke(
+                Path::new("tmux"),
+                &f.home,
+                &[
+                    "-S",
+                    f.socket.to_str().unwrap(),
+                    "list-sessions",
+                    "-F",
+                    "#{session_id}|#{pid}",
+                ],
+            ))
+        };
+        let before = server();
+        let args = ["install", "--tmux-config", config.to_str().unwrap()];
+        let preview = success(invoke(&binary, &f.home, &args));
+        assert!(preview.contains("External integration-only"));
+        assert!(!f.home.join("state").exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        let mut apply = args.to_vec();
+        apply.push("--yes");
+        let output = success(invoke(&binary, &f.home, &apply));
+        assert!(
+            output.contains("Activated 1 existing tmux server"),
+            "{output}"
+        );
+        let manifest_path = f.home.join("state/agent-float-term/install.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(value["format"], 3);
+        assert_eq!(value["external"]["path"], f.stable.to_str().unwrap());
+        assert!(value["current"].is_null());
+        assert!(value["releases"].as_array().unwrap().is_empty());
+        assert!(!f.home.join(".local/bin/agent-float-term").exists());
+        assert!(!f.home.join("data/agent-float-term/current").exists());
+        assert!(!f.home.join("data/agent-float-term/releases").exists());
+        assert!(
+            !unwanted.exists(),
+            "hot reload sourced unrelated user commands"
+        );
+        assert_eq!(server(), before, "existing server or sessions changed");
+        let doctor = success(invoke(
+            &binary,
+            &f.home,
+            &["doctor", "--socket", f.socket.to_str().unwrap()],
+        ));
+        assert!(doctor.contains("Owned key binding: intact"), "{doctor}");
+        success(invoke(&binary, &f.home, &apply));
+        assert_eq!(fs::read(manifest_path).unwrap(), manifest);
+        assert_eq!(fs::read(&f.keg).unwrap(), payload);
+        assert_eq!(
+            f.home
+                .join("brew/bin/agent-float-term")
+                .canonicalize()
+                .unwrap(),
+            f.keg
+        );
+        assert_eq!(
+            fs::metadata(&f.keg).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[test]
+fn homebrew_install_reports_activation_conflict_without_overwriting_key() {
+    let f = BrewFixture::new();
+    let tm = |args: &[&str]| {
+        let mut all = vec!["-S", f.socket.to_str().unwrap()];
+        all.extend_from_slice(args);
+        success(invoke(Path::new("tmux"), &f.home, &all))
+    };
+    tm(&["bind-key", "-n", "F7", "display-message", "USER_BINDING"]);
+    let before = tm(&["list-keys"]);
+    let config = f.home.join(".tmux.conf");
+    let result = invoke(
+        &f.stable,
+        &f.home,
+        &[
+            "install",
+            "--tmux-config",
+            config.to_str().unwrap(),
+            "--yes",
+        ],
+    );
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("configuration succeeded") && error.contains("already bound"),
+        "{error}"
+    );
+    assert_eq!(tm(&["list-keys"]), before);
+    assert!(f.home.join("state/agent-float-term/install.json").exists());
+    assert!(config.exists());
+    assert!(!f.home.join(".local/bin/agent-float-term").exists());
+}
+
+#[test]
 fn actual_payload_install_update_rollback_and_uninstall() {
     let temp = tempfile::Builder::new()
         .prefix("aft install ")
@@ -583,9 +708,11 @@ fn parallel_fixture_copies_and_execs_are_safe() {
         for _ in 0..4 {
             scope.spawn(|| {
                 let temp = tempfile::tempdir().unwrap();
-                let binary = temp.path().join("agent-float-term");
                 start.wait();
-                for _ in 0..16 {
+                for iteration in 0..16 {
+                    // Publish fresh images, as package upgrades do. Rewriting a
+                    // previously executed Mach-O inode races macOS signature caches.
+                    let binary = temp.path().join(format!("agent-float-term-{iteration}"));
                     copy_payload(env!("CARGO_BIN_EXE_agent-float-term"), &binary);
                     assert_eq!(
                         success(invoke(&binary, temp.path(), &["--version"])).trim(),

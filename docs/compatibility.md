@@ -1,6 +1,6 @@
 # Compatibility And Validation
 
-**Current status: Neovim navigation and optional popup status-mouse patch locally tested.**
+**Current status: explicit Homebrew setup and hot-reload locally tested; pending release.**
 The runtime minimum is **3.4**. Each float belongs to one AI invocation and is
 reset when it exits. Tmux keyboard shortcuts target the main terminal, except
 `Ctrl+h/j/k/l` remain with foreground Neovim inside the float.
@@ -8,15 +8,22 @@ Returning to the original AI pane restores a
 temporarily hidden float; explicit F7 hide disables restoration until reopened.
 Current evidence is separate from the historical results below.
 
-These latest changes have not been published or tested in remote CI. The older
-0.2.2 crate is already public. Historical source/archive validation does not
+These latest setup changes have not been published or tested in remote CI. The
+published 0.3.4 package is unchanged. Historical source/archive validation does not
 establish acceptance of new runtime changes or a completed remote matrix.
 
 ## Current Change Validation
 
+The unreleased explicit Homebrew setup/hot-reload change passed 102 macOS ARM64
+Rust tests and 100 non-root Debian 12 ARM64 Rust tests, including native package
+ownership, no-shadow-copy installation, existing-server activation, matching-client
+selection, conflict preservation, and discovery isolation. Formula-DSL integration
+passed on both platforms. Real Homebrew installation and remote CI for this change
+remain pending; the published 0.3.4 formula/assets were not modified.
+
 | Change | Evidence | Still Needed |
 | --- | --- | --- |
-| Configuration, installer, and Rust APIs | 90 macOS ARM64 tests and Clippy passed; current Linux ARM64 test-target cross-check passed; 83 non-root Debian 12 ARM64 tests passed before first-use changes | Current Linux runtime and remote CI acceptance |
+| Configuration, installer, and Rust APIs | 102 macOS ARM64 and 100 non-root Debian 12 ARM64 tests passed, including explicit Homebrew setup and server discovery; Clippy passed locally | Linux x86_64 and remote CI acceptance of the new flow |
 | Generated integration layout | Fresh install, Bash/Zsh migration, no-write preview, idempotency, byte/mode preservation, collision/edited-file refusal, and migrated uninstall passed; all four release smoke suites passed | Broader Linux runtime migration coverage |
 | JSON-based smoke fixtures | All five current suites passed on macOS tmux 3.7c: core PTY and package upgrade used release builds; startup/autostart/theme used debug. Current core PTY also passed on 3.5a (debug) | Updated archive acceptance, Linux runtime, minimum 3.4 rerun, and latency benchmark |
 | Neovim navigation | Real Neovim 0.11.0 with four splits and isolated mappings; all four keys, rapid sequences, root/prefix/prefix2/custom-table main routing, queued handoff, shared navigation prefix, suspend/resume, failed helper, unchanged bindings, and retained state passed | Linux/remote CI runtime, other editor versions, and personal navigation-plugin behavior |

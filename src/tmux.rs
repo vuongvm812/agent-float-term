@@ -17,9 +17,11 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod activation;
 mod lifecycle;
 mod routing;
 
+pub use activation::bind_all;
 pub use lifecycle::watch;
 
 const GENERATION: &str = "@aft_generation";
@@ -102,6 +104,7 @@ fn tmux_quote(value: &str) -> String {
 }
 
 fn capture(command: &mut Command, input: Option<&[u8]>) -> Result<Output> {
+    activation::check_deadline()?;
     command.stdin(if input.is_some() {
         Stdio::piped()
     } else {
@@ -138,6 +141,7 @@ fn capture(command: &mut Command, input: Option<&[u8]>) -> Result<Output> {
         let mut err_done = false;
         let mut remaining = input.unwrap_or_default();
         loop {
+            activation::check_deadline()?;
             ensure!(
                 started.elapsed() < COMMAND_TIMEOUT,
                 "tmux command timed out"
@@ -245,35 +249,39 @@ impl Tmux {
             .to_owned())
     }
 
-    fn matching_client(mut self) -> Result<Self> {
-        let server = self.output(&["display-message", "-p", "#{version}"])?;
-        let client = self.client_version()?;
-        if client == server {
+    fn matching_client(self) -> Result<Self> {
+        let server = self.output(&["display-message", "-p", "#{version}"]);
+        let client = if server.is_ok() {
+            Some(self.client_version()?)
+        } else {
+            None
+        };
+        if server.as_ref().ok() == client.as_ref() && client.is_some() {
             return Ok(self);
         }
-        // Preserve an explicitly approved per-server client across login-shell PATH
-        // changes. Never download a client or restart a server to resolve a mismatch.
-        if let Some(record) = read_record(&record_path(&self.socket)?)? {
-            if record.socket == self.socket {
-                if let Some(binary) = record.binary {
-                    let mut candidate = self.clone();
-                    candidate.binary = binary;
-                    if candidate
-                        .client_version()
-                        .is_ok_and(|version| version == server)
-                    {
-                        self.binary = candidate.binary;
-                        return Ok(self);
-                    }
-                }
+        if let Some(candidate) = activation::recorded_client(&self)? {
+            return Ok(candidate);
+        }
+        let server = server.context("primary tmux client cannot communicate with the server; no compatible approved client. Set AFT_TMUX_BINARY to a matching executable and run bind; existing sessions were preserved")?;
+        if env::var_os("AFT_TMUX_BINARY")
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            if let Some(candidate) = activation::cached_client(&self, &server)? {
+                return Ok(candidate);
             }
         }
-        bail!("tmux client {client} does not match running server {server}; terminal FD passing can fail. Set AFT_TMUX_BINARY to a matching {server} executable and run bind. Existing sessions were preserved")
+        let client = client.context("missing tmux client version")?;
+        bail!("tmux client {client} does not match running server {server}; no compatible client was found; terminal FD passing can fail. Set AFT_TMUX_BINARY to a matching {server} executable and run bind. Existing sessions were preserved")
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
-        command.arg("-S").arg(&self.socket).env_remove("TMUX");
+        command
+            .arg("-S")
+            .arg(&self.socket)
+            .arg("-N")
+            .env_remove("TMUX");
         command
     }
 
@@ -786,18 +794,39 @@ fn binding_matches(binding: &Binding, live: Option<&str>) -> bool {
 }
 
 pub fn bind(socket: Option<PathBuf>, replace_key: bool) -> Result<()> {
-    let mut config = config::load()?;
+    let config = config::load()?;
     let tmux = Tmux::resolve(socket)?;
+    bind_selected(tmux, config, replace_key, None)
+}
+
+fn bind_selected(
+    tmux: Tmux,
+    mut config: Config,
+    replace_key: bool,
+    identity: Option<(u64, u64)>,
+) -> Result<()> {
     let verified_stamp = binary_stamp(&tmux.binary)?;
     let server_version = tmux.compatible()?;
     ensure!(
         binary_stamp(&tmux.binary)? == verified_stamp,
         "tmux executable changed while checking its version; retry bind"
     );
+    if let Some(identity) = identity {
+        ensure!(
+            activation::socket_identity(&tmux.socket)? == Some(identity),
+            "tmux socket changed before binding; retry bind --all"
+        );
+    }
     crate::install::register_homebrew()?;
     runtime_dir()?;
     let record_path = record_path(&tmux.socket)?;
     let _guard = lock(&record_path.with_extension("lock"))?;
+    if let Some(identity) = identity {
+        ensure!(
+            activation::socket_identity(&tmux.socket)? == Some(identity),
+            "tmux socket changed while acquiring binding guard; retry bind --all"
+        );
+    }
     let mut generation = tmux.global(GENERATION)?;
     let existing = read_record(&record_path)?;
     let existing = existing.filter(|b| b.socket == tmux.socket && b.generation == generation);

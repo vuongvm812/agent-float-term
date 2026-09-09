@@ -13,6 +13,7 @@ tmux 3.4, 3.5a, and 3.7c; see the current validation table for remaining limits.
 | --- | --- |
 | `install [--external-binary PATH] [--tmux-config PATH] [--shell-config PATH --shell-kind bash\|zsh] [--yes]` | Preview installation; apply with `--yes`. External mode registers integrations without owning the executable. Each startup file requires its own opt-in flag. |
 | `bind [--socket PATH] [--replace-key]` | Integrate with an existing server; foreign-key replacement requires opt-in. |
+| `bind --all` (unreleased) | Bind discovered existing user-owned servers; cannot combine with `--socket` or `--replace-key`. |
 | `start` | Open a dedicated normal shell, or initialize/bind the existing server when inside tmux. |
 | `doctor [--socket PATH]` | Read-only dependency, JSON config, and selected-server diagnosis. |
 | `sessions [--socket PATH]` | Inspect owned floats, including retained orphans. |
@@ -54,14 +55,22 @@ The read-only preview lists these migration targets. `config.json` is untouched.
 
 ## Package-Managed Installation
 
-Homebrew and Cargo retain ownership of their executable. Starting with the next
-Homebrew release, the first `bind` or interactive `start` registers the verified
-stable `opt` path automatically. The formula itself does not edit user homes.
-Cargo and older Homebrew binaries use explicit
+Homebrew and Cargo retain ownership of their executable. **Pending next release**,
+`install` detects a native Homebrew executable from its verified Cellar path and
+automatically registers the stable same-prefix `opt` path as external. The first
+`bind` or interactive `start` can also register that path without startup-file
+edits. The formula has no user-setup `post_install` hook: Homebrew's current
+`run_post_install` uses a temporary `HOME` and sandbox `deny_read_home`.
+The user explicitly runs `install --tmux-config PATH --yes` after Homebrew returns
+to authorize startup-file integration and activation. Cargo and published
+Homebrew **0.3.4** binaries use explicit
 `install --external-binary /absolute/stable/path`, previewed before applying with
 `--yes`. See the [Homebrew and Cargo examples](installation.md). This mode
 creates only owned integrations and private installation state, not a binary
-copy, `current` link, release directory, or `~/.local/bin` link.
+copy, `current` link, release directory, or `~/.local/bin` directory/link. It never
+copies, chmods, or deletes the Homebrew executable. Existing explicit external
+registrations retain their mode/path; managed conflicts require explicit migration.
+The published 0.3.4 tap formula is unchanged; see the installation guide's fallback.
 
 The supplied path must resolve to the binary running the registration. Use
 Homebrew's stable `opt` path or the actual Cargo installation-root `bin` path,
@@ -124,6 +133,13 @@ Changing managed/external ownership or an external path is deliberately not an
 in-place operation. Package-manager updates at the same stable path are not a
 method change.
 
+Homebrew already links into its prefix's `bin` (`/opt/homebrew/bin` on Apple
+Silicon; other prefixes vary). An old managed `~/.local/bin/agent-float-term` can
+shadow that link. Use `aft="$(brew --prefix agent-float-term)/bin/agent-float-term"`
+to select the stable Homebrew binary explicitly, but do not run its registration
+against existing managed state before completing the reviewed migration below.
+There is no automatic deletion or force-migration option.
+
 1. Finish or safely stop work in existing floats before switching. Do not kill
    the tmux server or unrelated jobs.
 2. Run the old installation's `uninstall` preview, then `uninstall --yes`, while
@@ -139,6 +155,42 @@ method change.
 
 User `config.json` is preserved. If switching to Cargo with `--root ~/.local`,
 remove the previous managed installation before Cargo writes that destination.
+
+## Multi-Server Activation
+
+**Unreleased, pending next release; not available in published 0.3.4.** Public
+`install --yes --tmux-config PATH` calls `tmux::bind_all` after the installer
+returns successfully and its lock is released. Preview, plain `install --yes`
+without `--tmux-config`, and shell-only installation never auto-activate, including
+when they retain a previously selected tmux config. Run `agent-float-term bind --all`
+to request activation separately or retry it; `--all` conflicts with both
+`--socket` and `--replace-key`.
+
+Discovery considers only existing user-owned sockets from these sources:
+
+- Valid application-state binding records.
+- The current `TMUX` context.
+- `$TMUX_TMPDIR/tmux-UID`, or `/tmp/tmux-UID` if `TMUX_TMPDIR` is unset. An explicit
+  override scopes this source and disables the default `/tmp` fallback.
+- `$XDG_RUNTIME_DIR/tmux-UID`, when configured, plus the application's dedicated socket.
+
+Discovery creates no directories or sockets, is bounded to 256 entries, 32
+servers, and 60 seconds, and deduplicates socket aliases by inode. It does not
+search arbitrary custom socket locations: use `bind --socket PATH` for those.
+Tests and automation must isolate all discovery sources, not just HOME.
+
+Activation refreshes **only the agent binding**, not the full `~/.tmux.conf` or
+its plugins/startup commands. Foreign-key conflicts are refused without forcing
+replacement. Existing-server operations pass tmux `-N` to prevent an implicit
+server start; activation never starts, restarts, or deletes servers. Missing
+sockets or no existing servers are a successful no-op (exit 0).
+
+Client safety/compatibility failures, binding conflicts, or other partial
+activation failures are reported as an error. For automatic post-install
+activation, the configuration is **already installed** and is not rolled back.
+Review the report, resolve the issue, and retry `bind --all`; do not reinstall
+blindly, force key replacement, or restart live servers. Matching-client selection
+is described below.
 
 ## Existing Or Dedicated tmux
 
@@ -233,6 +285,17 @@ optional field for older records). If PATH later selects a mismatched client,
 the recorded client can be reused only after its version matches the server.
 No client is downloaded and no live server is restarted automatically.
 
+**Pending next release:** an approved recorded client can be reused after matching
+the server even if the primary client fails at the protocol level. When needed
+and with no explicit `AFT_TMUX_BINARY` override, selection can also use an existing
+safe exact-version client at
+`${XDG_DATA_HOME:-$HOME/.local/share}/agent-float-term/compat/tmux-VERSION/bin/tmux`.
+The application data root must be private; nested cache directories must be owned
+and not group/world-writable (0755 is allowed). Unsafe or unavailable compatible
+clients are reported, not downloaded by default. This is client reuse, not a
+patched-tmux provisioning feature; mouse support still requires a patched
+**running server**. An explicit override is not silently replaced by a cache client.
+
 F7 caches version verification using the recorded executable metadata fingerprint,
 client path, server version, and server-global generation. `bind` verifies that
 the fingerprint is unchanged across the version check before recording it;
@@ -246,9 +309,12 @@ needed, explicitly select a trusted matching client:
 
 ```sh
 /absolute/path/to/tmux -V
-/absolute/path/to/tmux -S /absolute/path/to/tmux.sock display-message -p '#{version}'
+/absolute/path/to/tmux -N -S /absolute/path/to/tmux.sock display-message -p '#{version}'
 AFT_TMUX_BINARY=/absolute/path/to/tmux \
   agent-float-term doctor --socket /absolute/path/to/tmux.sock
+# After reviewing diagnostics, bind with that matching client:
+AFT_TMUX_BINARY=/absolute/path/to/tmux \
+  agent-float-term bind --socket /absolute/path/to/tmux.sock
 ```
 
 Use an absolute executable path for an advanced override, not a version string
@@ -541,6 +607,8 @@ publication checks. Do not restart servers with live jobs just to clear bindings
 | --- | --- |
 | Installation refuses an unowned regular destination | Do not copy the binary into `~/.local/bin/agent-float-term` before installation. Inspect and relocate any existing file yourself if appropriate, then run the extracted/source binary's installer directly. |
 | Homebrew/Cargo install tries to create a managed binary copy | On first registration, use the package executable with `install --external-binary` and its absolute stable path. Existing managed installs need explicit migration first. |
+| Homebrew still runs an old managed executable | An old `~/.local/bin` entry may shadow Homebrew's prefix/bin link. Select the stable Homebrew binary explicitly, then follow reviewed migration steps before registering against managed state. |
+| Install reports partial activation (next release) | The config is already installed. Resolve reported key/client/socket issues and retry `bind --all`; custom sockets need `bind --socket PATH`. Do not force conflicts or restart live servers. |
 | External registration rejects a Cellar path or different source | Use Homebrew's `opt` path or the actual Cargo root, and invoke that same binary. Do not register from an older managed copy on PATH. |
 | External runtime rejects an unsafe or missing executable | Repair the package/path permissions using its package manager, or uninstall integrations with a supporting binary. Do not relax app state permissions to bypass the check. |
 | F7 never reaches the application | Check the terminal/OS key mapping, Fn mode, and tmux binding conflicts. |
