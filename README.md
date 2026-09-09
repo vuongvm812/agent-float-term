@@ -8,13 +8,6 @@ your AI CLI. Run your AI command normally in a tmux pane.
 Requires **tmux 3.4+** and macOS or Linux. Install your AI CLI normally.
 Homebrew supplies tmux; other methods require you to install it separately.
 
-**Release note:** The current published version is **0.3.4**. Automatic Homebrew
-detection during `install` and multi-server activation are **unreleased, pending
-the next release**; the published tap formula is unchanged. Use the
-[0.3.4 fallback](docs/installation.md#homebrew) until then.
-Choose one method; switching an existing installation requires the
-[migration steps](docs/operations.md#switching-installation-methods).
-
 ### Homebrew
 
 Install the package:
